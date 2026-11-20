@@ -12,3 +12,8 @@
 
 # where to save the params (if None, will not save)
 "SAVE_PATH": "models"
+# checkpoint/resume (see checkpointing.py). If set, training runs in chunks of
+# CHECKPOINT_INTERVAL * NUM_UPDATES updates and the full runner state is saved to
+# CHECKPOINT_DIR/<alg>_<env>_seed<SEED>/ after each chunk; rerunning resumes it.
+"CHECKPOINT_DIR": null
+"CHECKPOINT_INTERVAL": 0.05

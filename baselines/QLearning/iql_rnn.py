@@ -16,6 +16,10 @@ from flax.training.train_state import TrainState
 from omegaconf import OmegaConf
 
 import wandb
+
+import checkpointing
+import schedules
+from flat_buffer import FlatTrajectoryBuffer
 from jaxmarl import make
 from jaxmarl.environments.overcooked import overcooked_layouts
 from jaxmarl.environments.smax import map_name_to_scenario
@@ -109,7 +113,7 @@ def make_train(config, env):
     eps_scheduler = optax.linear_schedule(
         init_value=config["EPS_START"],
         end_value=config["EPS_FINISH"],
-        transition_steps=config["EPS_DECAY"] * config["NUM_UPDATES"],
+        transition_steps=schedules.eps_decay_updates(config),
     )
 
     def get_greedy_actions(q_vals, valid_actions):
@@ -151,7 +155,7 @@ def make_train(config, env):
     def unbatchify(x: jnp.ndarray):
         return {agent: x[i] for i, agent in enumerate(env.agents)}
 
-    def train(rng):
+    def train(rng, runner_state=None, num_updates=None):
 
         # INIT ENV
         original_seed = rng[0]
@@ -242,6 +246,8 @@ def make_train(config, env):
             sample_sequence_length=1,
             period=1,
         )
+        # one flat row per trajectory: keeps the buffer in place on GPU (flat_buffer.py)
+        buffer = FlatTrajectoryBuffer(buffer, sample_traj_unbatched)
         buffer_state = buffer.init(sample_traj_unbatched)
 
         # TRAINING LOOP
@@ -282,6 +288,9 @@ def make_train(config, env):
 
                 new_obs, new_env_state, rewards, dones, infos = wrapped_env.batch_step(
                     rng_s, env_state, actions
+                )
+                rewards, infos = schedules.add_shaped_reward(
+                    rewards, infos, train_state.timesteps, config
                 )
                 timestep = Timestep(
                     obs=last_obs,
@@ -485,7 +494,8 @@ def make_train(config, env):
                                 for k, v in metrics.items()
                             }
                         )
-                    wandb.log(metrics)
+                    if checkpointing.should_log(metrics):
+                        wandb.log(metrics)
 
                 jax.debug.callback(callback, metrics, original_seed)
 
@@ -517,6 +527,7 @@ def make_train(config, env):
                 obs, env_state, rewards, dones, infos = test_env.batch_step(
                     key_s, env_state, actions
                 )
+                infos = schedules.drop_shaped_reward(infos)
                 step_state = (params, env_state, obs, dones, hstate, rng)
                 return step_state, (rewards, dones, infos)
 
@@ -574,10 +585,14 @@ def make_train(config, env):
 
         # train
         rng, _rng = jax.random.split(rng)
-        runner_state = (train_state, buffer_state, test_state, _rng)
+        init_state = (train_state, buffer_state, test_state, _rng)
 
+        if runner_state is None:
+            runner_state = init_state
+        if num_updates is None:
+            num_updates = config["NUM_UPDATES"]
         runner_state, metrics = jax.lax.scan(
-            _update_step, runner_state, None, config["NUM_UPDATES"]
+            _update_step, runner_state, None, num_updates
         )
 
         return {"runner_state": runner_state, "metrics": metrics}
@@ -618,7 +633,9 @@ def single_run(config):
     alg_name = config.get("ALG_NAME", "iql_rnn")
     env, env_name = env_from_config(copy.deepcopy(config))
 
-    wandb.init(
+    ckpt_dir = checkpointing.checkpoint_dir(config, alg_name, env_name)
+    checkpointing.init_wandb(
+        ckpt_dir,
         entity=config["ENTITY"],
         project=config["PROJECT"],
         tags=[
@@ -634,8 +651,10 @@ def single_run(config):
     rng = jax.random.PRNGKey(config["SEED"])
 
     rngs = jax.random.split(rng, config["NUM_SEEDS"])
-    train_vjit = jax.jit(jax.vmap(make_train(config, env)))
-    outs = jax.block_until_ready(train_vjit(rngs))
+    runner_state = checkpointing.train(
+        config, make_train(config, env), rngs, ckpt_dir
+    )
+    outs = {"runner_state": runner_state}
 
     # save params
     if config.get("SAVE_PATH", None) is not None:

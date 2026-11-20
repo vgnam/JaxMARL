@@ -1,0 +1,56 @@
+# RAC on SMAX, configured as for SMAC in the RAC paper (Appendix C.3 / Table 4):
+# Normal-Net twin, m = 10 return intervals, beta = 0.01 (use 0.001 on 3s_vs_5z).
+#   python baselines/QLearning/rac_rnn.py +alg=rac_rnn_smax
+"ALG_NAME": "rac_rnn"
+"TOTAL_TIMESTEPS": 1e7
+"NUM_ENVS": 16
+"NUM_STEPS": 128
+"BUFFER_SIZE": 5000
+"BUFFER_BATCH_SIZE": 32
+"HIDDEN_SIZE": 512
+"EPS_START": 1.0
+"EPS_FINISH": 0.05
+"EPS_DECAY": 0.1 # percentage of updates
+"EPS_DECAY_STEPS": 250000 # fixed anneal length in env steps (overrides EPS_DECAY); HC-RAC did well at ~205k (10% of 2.05M)
+"MAX_GRAD_NORM": 10
+"TARGET_UPDATE_INTERVAL": 10
+"TAU": 1.
+"NUM_EPOCHS": 8
+"LR": 0.00005
+"LEARNING_STARTS": 10000 # timesteps
+"LR_LINEAR_DECAY": False
+"GAMMA": 0.99
+"REW_SCALE": 10. # scale the reward to the original scale of SMAC
+"OPTIMIZER": "radam" # radam (as iql_rnn), adam or rmsprop (RAC paper)
+
+# RAC
+"CONTEXT_LABELER": "return_bins"
+"SLOT_NUMBER": 10 # m
+# The SMAX team reward is the normalised damage dealt plus won_battle_bonus (1) on a
+# win, so an episode return lies in [0, 2], i.e. [0, 2 * REW_SCALE] once scaled.
+"RETURN_MIN": 0.0
+"RETURN_MAX": 20.0
+"TWIN_HEAD": "normal" # Normal-Net on SMAC: Q = W [h ; onehot(context)] + b
+"TWIN_HYPER_HIDDEN": 0
+"KL_WEIGHT": 0.001 # beta: 0.001 on 3s_vs_5z (the default map), 0.01 on the other maps
+"KL_WEIGHT_FINAL": null
+"KL_ANNEAL_START": 0
+"KL_ANNEAL_END": 0
+"TEACHER_CONTEXT_SELECT": "action_max"
+"TEACHER_TOPK": 4
+"TWIN_TARGET_CLAMP": False
+"KL_LOGIT_TEMPERATURE_FRAC": 0.0
+
+# ENV
+"ENV_NAME": "HeuristicEnemySMAX"
+"MAP_NAME": "3s_vs_5z"
+"ENV_KWARGS":
+  "see_enemy_actions": True
+  "walls_cause_death": True
+  "attack_mode": "closest"
+
+# evaluate
+"TEST_DURING_TRAINING": True
+"TEST_INTERVAL": 0.05 # as a fraction of updates, i.e. log every 5% of training process
+"TEST_NUM_STEPS": 128
+"TEST_NUM_ENVS": 512 # number of episodes to average over, can affect performance

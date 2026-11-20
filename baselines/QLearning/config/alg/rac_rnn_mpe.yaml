@@ -1,0 +1,52 @@
+# RAC (Li et al., NeurIPS 2025): behaviour Q + return-conditioned twin Q,
+# pulled towards the twin maximised over return contexts through a KL term.
+#   python baselines/QLearning/rac_rnn.py +alg=rac_rnn_mpe
+"ALG_NAME": "rac_rnn"
+"TOTAL_TIMESTEPS": 1e7
+"NUM_ENVS": 8
+"NUM_STEPS": 26
+"BUFFER_SIZE": 5000
+"BUFFER_BATCH_SIZE": 32
+"HIDDEN_SIZE": 64
+"EPS_START": 1.0
+"EPS_FINISH": 0.05
+"EPS_DECAY": 0.1 # percentage of updates
+"MAX_GRAD_NORM": 25
+"TARGET_UPDATE_INTERVAL": 200
+"TAU": 1.
+"NUM_EPOCHS": 1
+"LR": 0.005
+"LEARNING_STARTS": 10000 # timesteps
+"LR_LINEAR_DECAY": True
+"GAMMA": 0.9
+"OPTIMIZER": "radam" # radam (as iql_rnn), adam or rmsprop (RAC paper)
+
+# RAC
+"CONTEXT_LABELER": "return_bins" # one-hot bin of the episode return
+"SLOT_NUMBER": 15 # m, number of return bins
+# Per-agent episode return range (in REW_SCALE units). simple_spread (25 steps):
+# a random policy scores ~[-62, -8]; returns outside the range go to the edge bins.
+"RETURN_MIN": -60.0
+"RETURN_MAX": 0.0
+"TWIN_HEAD": "hyper" # RAC's Hyper-Net (matrix game / predator-prey); "normal" on SMAC
+"TWIN_HYPER_HIDDEN": 0 # 0: plain hypernet over the one-hot context
+"KL_WEIGHT": 1.0 # beta
+"KL_WEIGHT_FINAL": null # null keeps KL_WEIGHT constant
+"KL_ANNEAL_START": 0
+"KL_ANNEAL_END": 0
+"TEACHER_CONTEXT_SELECT": "action_max" # max over contexts per action (RAC)
+"TEACHER_TOPK": 4
+"TWIN_TARGET_CLAMP": False
+"KL_LOGIT_TEMPERATURE_FRAC": 0.0
+
+# ENV
+"ENV_NAME": "MPE_simple_spread_v3"
+"ENV_KWARGS": {}
+
+# evaluate
+"TEST_DURING_TRAINING": True
+"TEST_INTERVAL": 0.05 # as a fraction of updates, i.e. log every 5% of training process
+"TEST_NUM_STEPS": 30
+"TEST_NUM_ENVS": 512 # number of episodes to average over, can affect performance
+
+"LOG_AGENTS_SEPARATELY": True

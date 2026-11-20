@@ -1,0 +1,84 @@
+# HC-RAC (CONTRAIL) on jaxrobotarium (same hyper-parameters as ql_rnn_jaxrobotarium).
+#   python baselines/QLearning/rac_rnn.py +alg=hcrac_rnn_jaxrobotarium
+"ALG_NAME": "hcrac_rnn"
+"TOTAL_TIMESTEPS": 3e6
+"NUM_ENVS": 8
+"NUM_STEPS": 101 # one 100-step episode per env per update
+"BUFFER_SIZE": 5000
+"BUFFER_BATCH_SIZE": 32
+"HIDDEN_SIZE": 256
+"EPS_START": 1.0
+"EPS_FINISH": 0.05
+"EPS_DECAY": 0.1 # percentage of updates
+"MAX_GRAD_NORM": 25
+"TARGET_UPDATE_INTERVAL": 200
+"TAU": 1.
+"NUM_EPOCHS": 1
+"LR": 0.005
+"LEARNING_STARTS": 10000 # timesteps
+"LR_LINEAR_DECAY": True
+"GAMMA": 0.9
+"OPTIMIZER": "radam" # as iql_rnn
+
+# HC-RAC, main setting (as PyMARL corac_mate / hcrac_rnn_smax): stationary
+# context (fixed return range, EMA encoder, 2 bank pushes), constant KL_WEIGHT and
+# RAC's per-action teacher (action_max).
+"CONTEXT_LABELER": "corac" # continuous contexts instead of RAC's one-hot bins
+"TWIN_HEAD": "hyper"
+"TWIN_HYPER_HIDDEN": 64 # zero-delta hypernetwork width
+"TWIN_TARGET_CLAMP": True # bound twin target and teacher by the realisable discounted return
+"KL_LOGIT_TEMPERATURE_FRAC": 0.0
+"KL_WEIGHT": 0.5 # as rac_rnn_* (untuned here)
+"KL_WEIGHT_FINAL": null # null = constant KL_WEIGHT
+"KL_ANNEAL_START": 0
+"KL_ANNEAL_END": 0
+"TEACHER_CONTEXT_SELECT": "action_max"
+"TEACHER_TOPK": 4
+# context c = [phi(R) ; u]
+"CORAC_USE_RETURN": True
+"CORAC_USE_TRAJECTORY": True
+"CORAC_N_FREQ": 16 # cosine features of the return
+"CORAC_EMBED_DIM": 32 # trajectory embedding (TCL)
+# navigation (100 steps): -distance to goal each step, 0 at the goal. A random
+# policy scores ~[-240, -41] per agent.
+"CORAC_RETURN_RANGE": [-240.0, 0.0] # = RETURN_MIN / RETURN_MAX of rac_rnn_*
+"CORAC_TARGET_TAU": 0.005 # EMA context encoder
+"CORAC_BANK_PUSH": 2 # contexts pushed per update once the bank is full
+"CORAC_BANK_SIZE": 64 # contexts per agent the teacher maximises over
+"CORAC_SEGMENT_LEN": 5 # steps per TCL window
+"CORAC_HIDDEN_DIM": 64
+"CORAC_PROJ_DIM": 32
+"CORAC_TEMPERATURE": 0.1
+"CORAC_N_HARD": 4 # outcome-swapped negatives per anchor
+"CORAC_POOL_SIZE": 4096 # candidate steps for the neighbour search
+"CORAC_STAT_MOMENTUM": 0.01 # only used without CORAC_RETURN_RANGE
+"CORAC_MIN_STD_FRAC": 0.0
+"CORAC_LR": 0.0005
+
+# ENV (as ql_rnn_jaxrobotarium). Other scenarios (discovery, warehouse, rware,
+# predator_prey, foraging, material_transport) need their own ENV_KWARGS and
+# return range. Needs the jaxrobotarium submodule:
+#   git submodule update --init --recursive jaxmarl/environments/robotarium
+#   pip install -e jaxmarl/environments/robotarium #       -e jaxmarl/environments/robotarium/jaxrobotarium/robotarium_python_simulator jaxopt
+"ENV_NAME": "JaxRobotarium_navigation"
+"ENV_KWARGS": {
+  "num_agents": 3,
+  "max_steps": 100,
+  "action_type": "Discrete",
+  "robotarium": {
+    "number_of_robots": 3,
+    "show_figure": False,
+    "sim_in_real_time": False,
+  },
+  "controller": {
+    "controller": "clf_uni_position",
+    "barrier_fn": "robust_barriers",
+  },
+  "update_frequency": 30
+}
+
+# evaluate
+"TEST_DURING_TRAINING": True
+"TEST_INTERVAL": 0.05 # as a fraction of updates, i.e. log every 5% of training process
+"TEST_NUM_STEPS": 101
+"TEST_NUM_ENVS": 64 # number of episodes to average over, can affect performance
