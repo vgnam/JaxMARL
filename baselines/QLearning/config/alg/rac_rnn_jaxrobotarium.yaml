@@ -65,3 +65,5 @@
 "TEST_INTERVAL": 0.05 # as a fraction of updates, i.e. log every 5% of training process
 "TEST_NUM_STEPS": 101
 "TEST_NUM_ENVS": 64 # number of episodes to average over, can affect performance
+
+"LOG_AGENTS_SEPARATELY": True # as ql_rnn_jaxrobotarium

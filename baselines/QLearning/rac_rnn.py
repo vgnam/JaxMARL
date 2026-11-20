@@ -21,9 +21,10 @@ episode return plus a trajectory embedding learned with Trajectory Contrastive
 Learning (positives: two windows of the same episode; negatives: other episodes
 and "outcome-swapped" windows). The twin reads c through a zero-delta
 hypernetwork and the teacher maximises over a FIFO bank of recent contexts. The
-``hcrac`` presets are step C of the HC-RAC stability ladder: fixed return range
-and an EMA context encoder (A), kl_weight annealed to 0 (B), and a teacher that
-picks one context per step (``context_argmax``, C).
+``hcrac`` presets use a fixed return range and an EMA context encoder (step A of
+the HC-RAC stability ladder), a constant kl_weight and RAC's per-action teacher
+(``action_max``); ``KL_WEIGHT_FINAL`` and ``TEACHER_CONTEXT_SELECT:
+context_argmax`` give ladder steps B and C.
 
 Execution only uses the behaviour Q, exactly as IQL. The rollout, buffer and
 testing code follows ``iql_rnn.py``. Episodes are recovered inside every stored

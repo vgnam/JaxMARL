@@ -31,10 +31,20 @@ PQN-VDN supports:
 ### Fully decentralized: RAC, HC-RAC and I2Q
 
 These learners only use each agent's own local history, reward and actions, with
-no mixer and no global state. They share IQL's rollout, replay buffer, recurrent
-Q-network and greedy evaluation, and support MPE, SMAX, JaxRobotarium and
-Overcooked (`*_rnn_mpe` / `*_rnn_smax` / `*_rnn_jaxrobotarium` /
-`*_rnn_overcooked` configs; `ql_rnn_overcooked` is the matching RNN IQL).
+no mixer and no global state. Every preset copies the hyper-parameters of the
+IQL baseline JaxMARL ships for that environment and only adds the method's own
+keys, so each method differs from IQL by its algorithm alone:
+
+| Env | IQL baseline (unchanged) | RAC / HC-RAC / I2Q |
+|---|---|---|
+| MPE | `iql_rnn.py +alg=ql_rnn_mpe` | `rac_rnn.py` / `i2q_rnn.py`, `*_rnn_mpe` |
+| SMAX | `iql_rnn.py +alg=ql_rnn_smax` | `rac_rnn.py` / `i2q_rnn.py`, `*_rnn_smax` |
+| JaxRobotarium | `iql_rnn.py +alg=ql_rnn_jaxrobotarium` | `rac_rnn.py` / `i2q_rnn.py`, `*_rnn_jaxrobotarium` |
+| Overcooked | `iql_cnn_overcooked.py +alg=ql_cnn_overcooked` | `rac_cnn_overcooked.py` / `i2q_cnn_overcooked.py`, `*_cnn_overcooked` |
+
+The RNN learners share `iql_rnn.py`'s rollout, replay buffer, recurrent
+Q-network and greedy evaluation; the Overcooked ones share
+`iql_cnn_overcooked.py`'s CNN, 1-step rollouts and flat transition buffer.
 
 - **RAC** (`rac_rnn.py`, `+alg=rac_rnn_*`): besides the behaviour Q, each agent
   trains a twin Q conditioned on a one-hot bin of the episode return
@@ -49,7 +59,7 @@ Overcooked (`*_rnn_mpe` / `*_rnn_smax` / `*_rnn_jaxrobotarium` /
   the teacher maximises over a bank of recent contexts. `hcrac_rnn_smax` is the
   main HC-RAC setting (as PyMARL `corac_mate`): fixed return range and EMA
   context encoder, a constant `KL_WEIGHT` and RAC's per-action teacher
-  (`action_max`); so are the `mpe`, `jaxrobotarium` and `overcooked` presets.
+  (`action_max`); so are the `mpe`, `jaxrobotarium` and `cnn_overcooked` presets.
   Step C of the stability ladder (`TEACHER_CONTEXT_SELECT: context_argmax`)
   keeps one context per step instead.
 - **I2Q** (`i2q_rnn.py`, `+alg=i2q_rnn_*`): each agent fits `Q_ss(h, h')` and
@@ -70,15 +80,21 @@ python baselines/QLearning/rac_rnn.py +alg=rac_rnn_mpe
 python baselines/QLearning/rac_rnn.py +alg=hcrac_rnn_smax alg.MAP_NAME=2s3z alg.KL_WEIGHT=0.01
 python baselines/QLearning/i2q_rnn.py +alg=i2q_rnn_smax
 python baselines/QLearning/rac_rnn.py +alg=hcrac_rnn_jaxrobotarium
-python baselines/QLearning/i2q_rnn.py +alg=i2q_rnn_overcooked alg.ENV_KWARGS.layout=coord_ring
+python baselines/QLearning/rac_cnn_overcooked.py +alg=hcrac_cnn_overcooked
+python baselines/QLearning/i2q_cnn_overcooked.py +alg=i2q_cnn_overcooked alg.ENV_KWARGS.layout=coord_ring
 ```
 
-Overcooked: the RNN learners take the grid observation flattened by
-`CTRolloutManager` and add `info["shaped_reward"]`, annealed from 1 to 0 over
-`REW_SHAPING_HORIZON` env steps, to the training reward (as
-`iql_cnn_overcooked.py`); the logged returns stay the sparse soup reward. One
-update rolls out a whole 400-step episode per env (`NUM_STEPS: 401`), so the
-buffer holds 1000 episodes.
+Overcooked: RAC and HC-RAC need the return of the whole episode, so in
+`rac_cnn_overcooked.py` transitions wait in a per-env staging area until their
+400-step episode ends, are labelled, and only then enter the flat buffer;
+learning starts after the first episodes (400 * `NUM_ENVS` env steps). I2Q needs
+no labels and uses IQL-CNN's buffer as is. All Overcooked learners add the
+annealed `info["shaped_reward"]` to the training reward as `iql_cnn_overcooked.py`
+does; the logged returns stay the sparse soup reward.
+
+`EPS_DECAY` is a fraction of the updates, as in JaxMARL. `EPS_DECAY_STEPS`
+(env steps, `++alg.EPS_DECAY_STEPS=...`) fixes the anneal length instead in the
+RNN learners.
 
 JaxRobotarium is a git submodule of JaxMARL with its own simulator submodule:
 
