@@ -361,6 +361,10 @@ class CoRACLabeler:
         self.target_tau = float(config.get("CORAC_TARGET_TAU", 0.0))
         self.bank_push = int(config.get("CORAC_BANK_PUSH", 0))
         self.bank_size = int(config.get("CORAC_BANK_SIZE", 64))
+        # TCL gradient steps per labelling call. The RNN learners label every
+        # update (1 is enough); the Overcooked CNN learner labels once per
+        # 400-step episode, so it needs many steps per call.
+        self.encoder_steps = max(1, int(config.get("CORAC_ENCODER_STEPS", 1)))
         return_range = config.get("CORAC_RETURN_RANGE", None)
         self.return_range = None
         if return_range is not None:
@@ -723,11 +727,6 @@ class CoRACLabeler:
         if self.use_trajectory:
             features, valid = self.step_features(state, obs, actions, rewards, ep_dones)
             seg_bt = seg.T  # (B, T)
-            (loss, tcl_stats), grads = jax.value_and_grad(
-                self.contrastive_loss, has_aux=True
-            )(state["params"], rng_l, state, features, valid, seg_bt)
-            stats.update(tcl_stats)
-            stats["corac_nce_loss"] = loss
             # Contexts from the (EMA) context encoder, before this update.
             ctx_params = (
                 state["target_params"] if self.target_tau > 0 else state["params"]
@@ -740,16 +739,27 @@ class CoRACLabeler:
             parts.append(u)
             stats["corac_embed_batch_std"] = u[:, 0].std(axis=1).mean()
 
-            updates, opt_state = self.tx.update(
-                grads, state["opt_state"], state["params"]
+            # ENCODER_STEPS TCL steps on this batch, each with freshly sampled
+            # pairs and hard negatives (1 = one step per labelling call).
+            def tcl_step(carry, step_rng):
+                params, opt_state, target = carry
+                (loss, tcl_stats), grads = jax.value_and_grad(
+                    self.contrastive_loss, has_aux=True
+                )(params, step_rng, state, features, valid, seg_bt)
+                updates, opt_state = self.tx.update(grads, opt_state, params)
+                params = optax.apply_updates(params, updates)
+                if self.target_tau > 0:
+                    target = optax.incremental_update(params, target, self.target_tau)
+                else:
+                    target = params
+                return (params, opt_state, target), {**tcl_stats, "corac_nce_loss": loss}
+
+            (params, opt_state, target), tcl_hist = jax.lax.scan(
+                tcl_step,
+                (state["params"], state["opt_state"], state["target_params"]),
+                jax.random.split(rng_l, self.encoder_steps),
             )
-            params = optax.apply_updates(state["params"], updates)
-            if self.target_tau > 0:
-                target = optax.incremental_update(
-                    params, state["target_params"], self.target_tau
-                )
-            else:
-                target = params
+            stats.update({k: v[-1] for k, v in tcl_hist.items()})
             state = {
                 **state,
                 "params": params,
@@ -830,6 +840,12 @@ def make_train(config, env):
     teacher_topk = int(config.get("TEACHER_TOPK", 4))
     twin_clamp = bool(config.get("TWIN_TARGET_CLAMP", False))
     kl_temp_frac = float(config.get("KL_LOGIT_TEMPERATURE_FRAC", 0.0) or 0.0)
+    # Leave actions an agent cannot take (padding for agents with fewer actions,
+    # e.g. the speaker in simple_speaker_listener) out of the KL.
+    kl_mask_unavailable = bool(config.get("KL_MASK_UNAVAILABLE", False))
+    # Ablation: act with the teacher (twin Q maximised over the contexts) instead
+    # of the behaviour Q, and train only the twin (no behaviour TD, no KL).
+    act_with_teacher = bool(config.get("ACT_WITH_TEACHER", False))
     slot_number = int(config.get("SLOT_NUMBER", 10))
     return_min = float(config.get("RETURN_MIN", 0.0))
     return_max = float(config.get("RETURN_MAX", 1.0))
@@ -996,6 +1012,33 @@ def make_train(config, env):
         apply_agent = jax.vmap(network.apply, in_axes=(None, 0, 0, 0))
         apply_twin = jax.vmap(twin.apply, in_axes=(None, 0, 0, 0, 0))
 
+        def teacher_bank(ctx_state):
+            """Teacher contexts (N, 1, 1, M, C) and their mask (N, 1, 1, M)."""
+            if use_corac:
+                return (
+                    ctx_state["bank"][:, None, None],
+                    labeler.bank_valid(ctx_state)[:, None, None],
+                )
+            return (
+                jnp.broadcast_to(
+                    jnp.eye(slot_number), (n_agents, 1, 1, slot_number, slot_number)
+                ),
+                jnp.ones((n_agents, 1, 1, slot_number), dtype=bool),
+            )
+
+        def acting_q(params, ctx_state, hs, _obs, _dones, avail):
+            """Q used to act for one step: the behaviour Q, or with ACT_WITH_TEACHER
+            the teacher (twin Q maximised over the bank). Returns (hs, (N, B, A))."""
+            if not act_with_teacher:
+                new_hs, q = apply_agent(params["agent"], hs, _obs, _dones)
+                return new_hs, q.squeeze(axis=1)
+            bank, bank_valid = teacher_bank(ctx_state)
+            new_hs, ctx_q = apply_twin(params["twin"], hs, _obs, _dones, bank)
+            q = select_teacher_q(
+                ctx_q, avail[:, None], bank_valid, teacher_mode, teacher_topk
+            )
+            return new_hs, q.squeeze(axis=1)
+
         # TRAINING LOOP
         def _update_step(runner_state, unused):
 
@@ -1007,11 +1050,11 @@ def make_train(config, env):
                 rng, rng_a, rng_s = jax.random.split(rng, 3)
                 _obs = batchify(last_obs)[:, np.newaxis]
                 _dones = batchify(last_dones)[:, np.newaxis]
-                new_hs, q_vals = apply_agent(
-                    train_state.params["agent"], hs, _obs, _dones
-                )
-                q_vals = q_vals.squeeze(axis=1)
                 avail_actions = wrapped_env.get_valid_actions(env_state.env_state)
+                new_hs, q_vals = acting_q(
+                    train_state.params, ctx_state, hs, _obs, _dones,
+                    batchify(avail_actions),
+                )
                 eps = eps_scheduler(train_state.n_updates)
                 _rngs = jax.random.split(rng_a, env.num_agents)
                 actions = jax.vmap(eps_greedy_exploration, in_axes=(0, 0, None, 0))(
@@ -1178,11 +1221,18 @@ def make_train(config, env):
                     td_loss = jnp.mean((chosen - target) ** 2)
                     twin_td_loss = jnp.mean((twin_chosen - twin_target) ** 2)
 
-                    kl = categorical_kl(
-                        q_vals[:, :-1] / kl_temperature, teacher_q / kl_temperature
-                    )
+                    kl_p = q_vals[:, :-1] / kl_temperature
+                    kl_q = teacher_q / kl_temperature
+                    if kl_mask_unavailable:
+                        ok = _avail[:, :-1] > 0
+                        kl_p = jnp.where(ok, kl_p, -1e10)
+                        kl_q = jnp.where(ok, kl_q, -1e10)
+                    kl = categorical_kl(kl_p, kl_q)
                     kl_loss = kl.mean()
-                    loss = td_loss + twin_td_loss + kl_w * kl_loss
+                    if act_with_teacher:
+                        loss = twin_td_loss
+                    else:
+                        loss = td_loss + twin_td_loss + kl_w * kl_loss
                     aux = {
                         "td_loss": td_loss,
                         "twin_td_loss": twin_td_loss,
@@ -1268,7 +1318,7 @@ def make_train(config, env):
                     train_state.n_updates
                     % int(config["NUM_UPDATES"] * config["TEST_INTERVAL"])
                     == 0,
-                    lambda _: get_greedy_metrics(_rng, train_state),
+                    lambda _: get_greedy_metrics(_rng, train_state, ctx_state),
                     lambda _: test_state,
                     operand=None,
                 )
@@ -1292,20 +1342,21 @@ def make_train(config, env):
             runner_state = (train_state, ctx_state, buffer_state, test_state, rng)
             return runner_state, metrics
 
-        def get_greedy_metrics(rng, train_state):
-            """Greedy evaluation of the behaviour Q (the only network used to act)."""
+        def get_greedy_metrics(rng, train_state, ctx_state):
+            """Greedy evaluation of the acting Q (the behaviour Q unless ACT_WITH_TEACHER)."""
             if not config.get("TEST_DURING_TRAINING", True):
                 return None
-            params = train_state.params["agent"]
+            params = train_state.params
 
             def _greedy_env_step(step_state, unused):
                 params, env_state, last_obs, last_dones, hstate, rng = step_state
                 rng, key_s = jax.random.split(rng)
                 _obs = batchify(last_obs)[:, np.newaxis]
                 _dones = batchify(last_dones)[:, np.newaxis]
-                hstate, q_vals = apply_agent(params, hstate, _obs, _dones)
-                q_vals = q_vals.squeeze(axis=1)
                 valid_actions = test_env.get_valid_actions(env_state.env_state)
+                hstate, q_vals = acting_q(
+                    params, ctx_state, hstate, _obs, _dones, batchify(valid_actions)
+                )
                 actions = get_greedy_actions(q_vals, batchify(valid_actions))
                 actions = unbatchify(actions)
                 obs, env_state, rewards, dones, infos = test_env.batch_step(
@@ -1351,7 +1402,7 @@ def make_train(config, env):
             return metrics
 
         rng, _rng = jax.random.split(rng)
-        test_state = get_greedy_metrics(_rng, train_state)
+        test_state = get_greedy_metrics(_rng, train_state, ctx_state)
 
         rng, _rng = jax.random.split(rng)
         init_state = (train_state, ctx_state, buffer_state, test_state, _rng)

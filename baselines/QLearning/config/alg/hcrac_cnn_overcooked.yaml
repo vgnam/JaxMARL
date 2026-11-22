@@ -54,6 +54,10 @@
 "CORAC_STAT_MOMENTUM": 0.01 # only used without CORAC_RETURN_RANGE
 "CORAC_MIN_STD_FRAC": 0.0
 "CORAC_LR": 0.0005
+# The CNN learner labels once per 400-step episode (every 400 * NUM_ENVS env
+# steps), so 1 TCL step per labelling gives only ~390 encoder updates in 5e6
+# steps. 64 steps per labelling gives ~25k, the order of the SMAX / MPE presets.
+"CORAC_ENCODER_STEPS": 64
 
 # env
 "ENV_NAME": "overcooked"
