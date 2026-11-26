@@ -1,0 +1,51 @@
+# IQL (iql_rnn.py) on Level-Based Foraging, default task Foraging-8x8-2p-2f-coop-v3.
+#   python baselines/QLearning/iql_rnn.py +alg=ql_rnn_lbf
+# JaxMARL ships no LBF preset: this is ql_rnn_mpe with the episode-dependent keys
+# set for 50-step LBF episodes and PyMARL/EPyMARL's IQL settings (2e6 steps,
+# gamma 0.99, lr 5e-4, grad clip 10, epsilon over 50k steps, about one replay
+# batch per collected episode, target update every 200 batches). With these,
+# IQL reaches ~0.9 greedy return on Foraging-8x8-2p-2f-v3 in 2e6 steps. On the
+# default -coop task it stays near 0, although PyMARL's IQL reaches ~0.89 there:
+# an open learner gap (see the README), not a property of the task.
+"TOTAL_TIMESTEPS": 2e6
+"NUM_ENVS": 8
+"NUM_STEPS": 51 # one 50-step episode per env per update (RNN learners reset every update)
+"BUFFER_SIZE": 5000
+"BUFFER_BATCH_SIZE": 32
+"HIDDEN_SIZE": 64
+"MIXER_EMBEDDING_DIM": 32 # just for qmix
+"MIXER_HYPERNET_HIDDEN_DIM": 128 # just for qmix
+"MIXER_INIT_SCALE": 0.001 # just for qmix
+"EPS_START": 1.0
+"EPS_FINISH": 0.05
+"EPS_DECAY": 0.1 # percentage of updates (overridden by EPS_DECAY_STEPS)
+"EPS_DECAY_STEPS": 50000 # env steps, as PyMARL iql (epsilon_anneal_time)
+"MAX_GRAD_NORM": 10 # as PyMARL (grad_norm_clip)
+"TARGET_UPDATE_INTERVAL": 25 # updates (x NUM_EPOCHS 8 = 200 batches)
+"TAU": 1.
+"NUM_EPOCHS": 8 # 8 batches per 8 collected episodes
+"LR": 0.0005 # as PyMARL (lr)
+"LEARNING_STARTS": 10000 # timesteps
+"LR_LINEAR_DECAY": True
+"GAMMA": 0.99
+
+# ENV: lbforaging Foraging-{field_size}x{field_size}-{num_agents}p-{max_num_food}f[-coop]-v3;
+# sight 2 = the -2s (partially observable) tasks, null = full observation.
+"ENV_NAME": "LBF"
+"ENV_KWARGS":
+  "num_agents": 2
+  "field_size": 8
+  "max_num_food": 2
+  "sight": null
+  "max_episode_steps": 50
+  "force_coop": True
+  "penalty": 0.0
+  "shared_rewards": True # team reward (sum over agents), episode return in [0, 1]
+
+# evaluate
+"TEST_DURING_TRAINING": True
+"TEST_INTERVAL": 0.05 # as a fraction of updates, i.e. log every 5% of training process
+"TEST_NUM_STEPS": 51
+"TEST_NUM_ENVS": 512 # number of episodes to average over, can affect performance
+
+"LOG_AGENTS_SEPARATELY": False # shared reward: every agent logs the same return

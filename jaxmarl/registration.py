@@ -27,6 +27,7 @@ from .environments import (
     SimpleTagMPE,
     SimpleWorldCommMPE,
     SwitchRiddle,
+    LBF,
 )
 
 # MABrax requires brax, an optional dependency
@@ -83,6 +84,10 @@ def make(env_id: str, **env_kwargs) -> MultiAgentEnv:
     # 2. Switch Riddle
     elif env_id == "switch_riddle":
         env = SwitchRiddle(**env_kwargs)
+
+    # 2b. Level-Based Foraging (port of lbforaging v3)
+    elif env_id == "LBF":
+        env = LBF(**env_kwargs)
 
     # 3. SMAX
     elif env_id == "SMAX":
@@ -184,6 +189,7 @@ registered_envs = [
     "MPE_simple_facmac_6a_v1",
     "MPE_simple_facmac_9a_v1",
     "switch_riddle",
+    "LBF",
     "SMAX",
     "HeuristicEnemySMAX",
     "LearnedPolicyEnemySMAX",

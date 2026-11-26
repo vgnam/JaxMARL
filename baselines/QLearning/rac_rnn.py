@@ -322,6 +322,59 @@ def select_teacher_q(context_q, avail_actions, bank_valid, mode, topk):
     return jnp.take_along_axis(context_q, best[..., None, None], axis=-2)[..., 0, :]
 
 
+def teacher_diagnostics(student_q, teacher_q, twin_q, avail, temperature):
+    """How much action information the KL teacher carries (logging only).
+
+    All inputs are (..., A) over the same steps; ``twin_q`` is the twin under
+    the episode's own context, trained by TD only (no KL), so it is the
+    reference the teacher's choice can be compared with.
+      *_entropy_norm   entropy of softmax(Q / T) over the available actions,
+                       divided by log(#available): 1 = uniform, 0 = one-hot.
+      *_adv_std        std of Q over the available actions (preference size,
+                       in return units, independent of T).
+      teacher_agree_*  fraction of steps whose teacher argmax equals the
+                       student's / own-context twin's argmax (chance ~1/A).
+      teacher_mode_frac  share of steps on the teacher's most chosen action.
+      teacher_act{a}   share of steps the teacher picks action a (A <= 8).
+    """
+    valid = avail > 0
+    n_valid = jnp.maximum(valid.sum(-1), 1)
+
+    def masked(q):
+        return jnp.where(valid, q, -1e10)
+
+    def entropy_norm(q):
+        logp = jax.nn.log_softmax(masked(q) / temperature, axis=-1)
+        ent = -jnp.where(valid, jnp.exp(logp) * logp, 0.0).sum(-1)
+        return (ent / jnp.log(jnp.maximum(n_valid, 2))).mean()
+
+    def adv_std(q):
+        mean = jnp.where(valid, q, 0.0).sum(-1, keepdims=True) / n_valid[..., None]
+        var = jnp.where(valid, (q - mean) ** 2, 0.0).sum(-1) / n_valid
+        return jnp.sqrt(var).mean()
+
+    t_arg = jnp.argmax(masked(teacher_q), axis=-1)
+    s_arg = jnp.argmax(masked(student_q), axis=-1)
+    w_arg = jnp.argmax(masked(twin_q), axis=-1)
+    n_actions = teacher_q.shape[-1]
+    act_frac = jax.nn.one_hot(t_arg, n_actions).reshape(-1, n_actions).mean(0)
+    out = {
+        "teacher_entropy_norm": entropy_norm(teacher_q),
+        "student_entropy_norm": entropy_norm(student_q),
+        "teacher_adv_std": adv_std(teacher_q),
+        "student_adv_std": adv_std(student_q),
+        "twin_adv_std": adv_std(twin_q),
+        "teacher_agree_student": (t_arg == s_arg).mean(),
+        "teacher_agree_twin": (t_arg == w_arg).mean(),
+        "student_agree_twin": (s_arg == w_arg).mean(),
+        "teacher_mode_frac": act_frac.max(),
+    }
+    if n_actions <= 8:
+        for a in range(n_actions):
+            out[f"teacher_act{a}"] = act_frac[a]
+    return out
+
+
 def categorical_kl(logits_p, logits_q):
     """KL(softmax(p) || softmax(q)) over the last axis."""
     log_p = jax.nn.log_softmax(logits_p, axis=-1)
@@ -1241,6 +1294,15 @@ def make_train(config, env):
                         "twin_qvals": twin_chosen.mean(),
                         "twin_target_mean": twin_target.mean(),
                     }
+                    aux.update(
+                        teacher_diagnostics(
+                            jax.lax.stop_gradient(q_vals[:, :-1]),
+                            teacher_q,
+                            jax.lax.stop_gradient(twin_q[:, :-1]),
+                            _avail[:, :-1],
+                            kl_temperature,
+                        )
+                    )
                     return loss, aux
 
                 (loss, aux), grads = jax.value_and_grad(_loss_fn, has_aux=True)(

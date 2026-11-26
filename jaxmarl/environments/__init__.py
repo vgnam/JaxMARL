@@ -22,6 +22,7 @@ from .overcooked_v2 import OvercookedV2, overcooked_v2_layouts
 from .smax import SMAX, HeuristicEnemySMAX, LearnedPolicyEnemySMAX
 from .storm import InTheGrid, InTheGrid_2p, InTheMatrix
 from .switch_riddle import SwitchRiddle
+from .lbf import LBF
 
 # MABrax requires brax, an optional dependency due to the deprecation: `pip install jaxmarl[mabrax]`
 try:
@@ -88,6 +89,7 @@ __all__ = [
     "InTheGrid_2p",
     "InTheMatrix",
     "SwitchRiddle",
+    "LBF",
     "SUBMODULE_ENVIRONMENTS",
     # jaxrobotarium submodule (conditionally available)
     "RWARE",

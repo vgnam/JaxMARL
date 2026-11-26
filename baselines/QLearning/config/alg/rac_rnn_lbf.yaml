@@ -1,0 +1,60 @@
+# RAC (Li et al., NeurIPS 2025) on Level-Based Foraging.
+# Hyper-parameters above the method block are ql_rnn_lbf's (IQL).
+#   python baselines/QLearning/rac_rnn.py +alg=rac_rnn_lbf
+"ALG_NAME": "rac_rnn"
+"TOTAL_TIMESTEPS": 2e6
+"NUM_ENVS": 8
+"NUM_STEPS": 51 # one 50-step episode per env per update
+"BUFFER_SIZE": 5000
+"BUFFER_BATCH_SIZE": 32
+"HIDDEN_SIZE": 64
+"EPS_START": 1.0
+"EPS_FINISH": 0.05
+"EPS_DECAY": 0.1 # percentage of updates (overridden by EPS_DECAY_STEPS)
+"EPS_DECAY_STEPS": 50000 # env steps, as PyMARL iql (epsilon_anneal_time)
+"MAX_GRAD_NORM": 10 # as PyMARL (grad_norm_clip)
+"TARGET_UPDATE_INTERVAL": 25
+"TAU": 1.
+"NUM_EPOCHS": 8
+"LR": 0.0005 # as PyMARL (lr)
+"LEARNING_STARTS": 10000 # timesteps
+"LR_LINEAR_DECAY": True
+"GAMMA": 0.99
+"OPTIMIZER": "radam" # radam (as iql_rnn), adam or rmsprop (RAC paper)
+
+# RAC
+"CONTEXT_LABELER": "return_bins" # one-hot bin of the episode return
+"SLOT_NUMBER": 10 # m, number of return bins
+# Normalised team reward: every LBF episode return is in [0, 1] (1 = all food).
+"RETURN_MIN": 0.0
+"RETURN_MAX": 1.0
+"TWIN_HEAD": "hyper"
+"TWIN_HYPER_HIDDEN": 0 # 0: plain hypernet over the one-hot context
+"KL_WEIGHT": 0.5 # beta, as the main MATE protocol (untuned here)
+"KL_WEIGHT_FINAL": null # null keeps KL_WEIGHT constant
+"KL_ANNEAL_START": 0
+"KL_ANNEAL_END": 0
+"TEACHER_CONTEXT_SELECT": "action_max" # max over contexts per action (RAC)
+"TEACHER_TOPK": 4
+"TWIN_TARGET_CLAMP": False
+"KL_LOGIT_TEMPERATURE_FRAC": 0.0
+
+# ENV (as ql_rnn_lbf)
+"ENV_NAME": "LBF"
+"ENV_KWARGS":
+  "num_agents": 2
+  "field_size": 8
+  "max_num_food": 2
+  "sight": null
+  "max_episode_steps": 50
+  "force_coop": True
+  "penalty": 0.0
+  "shared_rewards": True
+
+# evaluate
+"TEST_DURING_TRAINING": True
+"TEST_INTERVAL": 0.05 # as a fraction of updates, i.e. log every 5% of training process
+"TEST_NUM_STEPS": 51
+"TEST_NUM_ENVS": 512 # number of episodes to average over, can affect performance
+
+"LOG_AGENTS_SEPARATELY": False

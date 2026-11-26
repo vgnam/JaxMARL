@@ -41,6 +41,7 @@ keys, so each method differs from IQL by its algorithm alone:
 | SMAX | `iql_rnn.py +alg=ql_rnn_smax` | `rac_rnn.py` / `i2q_rnn.py`, `*_rnn_smax` |
 | JaxRobotarium | `iql_rnn.py +alg=ql_rnn_jaxrobotarium` | `rac_rnn.py` / `i2q_rnn.py`, `*_rnn_jaxrobotarium` |
 | Overcooked | `iql_cnn_overcooked.py +alg=ql_cnn_overcooked` | `rac_cnn_overcooked.py` / `i2q_cnn_overcooked.py`, `*_cnn_overcooked` |
+| LBF | `iql_rnn.py +alg=ql_rnn_lbf` (no upstream preset, see below) | `rac_rnn.py` / `i2q_rnn.py`, `*_rnn_lbf` |
 
 The RNN learners share `iql_rnn.py`'s rollout, replay buffer, recurrent
 Q-network and greedy evaluation; the Overcooked ones share
@@ -105,6 +106,29 @@ pip install -e jaxmarl/environments/robotarium     -e jaxmarl/environments/robot
 
 The presets use the navigation scenario (as `ql_rnn_jaxrobotarium`); the other
 scenarios need their own `ENV_KWARGS` and return range.
+
+LBF (`ENV_NAME: LBF`, `jaxmarl/environments/lbf`) is a JAX port of lbforaging v3,
+the version behind EPyMARL's `Foraging-*-v3` tasks; it matches lbforaging step by
+step (observations, movement, loading, rewards, termination). JaxMARL ships no
+LBF baseline, so `ql_rnn_lbf` is `ql_rnn_mpe` with the episode-dependent keys set
+for 50-step episodes and PyMARL/EPyMARL's IQL settings (2e6 steps, gamma 0.99,
+lr 5e-4, grad clip 10, epsilon over 50k steps, about one replay batch per
+collected episode, target update every 200 batches). IQL then reaches ~0.9
+greedy return on `Foraging-8x8-2p-2f-v3` (`force_coop: False`) in 2e6 steps. On
+the `-coop` task this IQL stays near 0, while PyMARL's IQL reaches ~0.89 on the
+same task (seed 0), so the gap is in the learner, not the environment; it is
+not resolved yet (PyMARL differs in last-action inputs, RMSprop, constant lr
+and one environment per batch). The
+default task is `Foraging-8x8-2p-2f-coop-v3`; `ENV_KWARGS` mirror the task name
+(`field_size`, `num_agents`, `max_num_food`, `force_coop`, `sight: 2` for `-2s`).
+With `shared_rewards` every agent gets the normalised team reward, so the
+episode return and the RAC / HC-RAC return range are [0, 1] on every task.
+
+```bash
+python baselines/QLearning/iql_rnn.py +alg=ql_rnn_lbf
+python baselines/QLearning/rac_rnn.py +alg=hcrac_rnn_lbf alg.ENV_KWARGS.sight=2
+python baselines/QLearning/i2q_rnn.py +alg=i2q_rnn_lbf alg.ENV_KWARGS.field_size=10 alg.ENV_KWARGS.num_agents=3 alg.ENV_KWARGS.max_num_food=3
+```
 
 #### Checkpoint and resume
 
