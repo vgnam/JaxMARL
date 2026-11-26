@@ -26,6 +26,15 @@ the HC-RAC stability ladder), a constant kl_weight and RAC's per-action teacher
 (``action_max``); ``KL_WEIGHT_FINAL`` and ``TEACHER_CONTEXT_SELECT:
 context_argmax`` give ladder steps B and C.
 
+In RAC the KL acts on the behaviour Q itself, which is also the network whose
+online argmax picks the double-Q bootstrap action; a strong pull therefore
+changes what the TD learns (the value of the teacher's policy). With
+``DECOUPLED_ACT_HEAD: True`` the KL instead trains an offset delta read from the
+(stop-gradient) recurrent features: the agent acts with Q_TD + delta while Q_TD
+is trained by TD alone, exactly as IQL (``DELTA_L2`` keeps delta small, the role
+the TD loss plays in the coupled version). Tests then also report the TD head
+alone (``test_td_*``).
+
 Execution only uses the behaviour Q, exactly as IQL. The rollout, buffer and
 testing code follows ``iql_rnn.py``. Episodes are recovered inside every stored
 rollout from ``dones["__all__"]``; the return of the last, unfinished episode of
@@ -120,6 +129,53 @@ class RNNQNetwork(nn.Module):
             bias_init=constant(0.0),
         )(embedding)
         return hidden, q_vals
+
+
+class RNNQDeltaNetwork(nn.Module):
+    """Behaviour Q with a separate acting offset (``DECOUPLED_ACT_HEAD``).
+
+    Returns [Q_TD ; delta] concatenated on the last axis (2 * action_dim):
+      * Q_TD is RNNQNetwork's head, trained by TD only; its online argmax and its
+        target copy give the bootstrap, so the value estimate is IQL's.
+      * delta is read from the recurrent features through a stop-gradient and
+        is trained by the KL only: the agent acts with Q_TD + delta. It starts
+        at zero (zero-initialised output layer), so acting starts as IQL.
+    The KL can therefore change behaviour but never the value estimate or the
+    features it is computed from.
+    """
+
+    action_dim: int
+    hidden_dim: int
+    delta_hidden: int = 64
+    init_scale: float = 1.0
+
+    @nn.compact
+    def __call__(self, hidden, obs, dones):
+        embedding = nn.Dense(
+            self.hidden_dim,
+            kernel_init=orthogonal(self.init_scale),
+            bias_init=constant(0.0),
+        )(obs)
+        embedding = nn.relu(embedding)
+        hidden, embedding = ScannedRNN()(hidden, (embedding, dones))
+        q_vals = nn.Dense(
+            self.action_dim,
+            kernel_init=orthogonal(self.init_scale),
+            bias_init=constant(0.0),
+        )(embedding)
+        x = jax.lax.stop_gradient(embedding)
+        x = nn.relu(
+            nn.Dense(
+                self.delta_hidden,
+                kernel_init=orthogonal(np.sqrt(2.0)),
+                bias_init=constant(0.0),
+                name="delta_hidden",
+            )(x)
+        )
+        delta = nn.Dense(
+            self.action_dim, kernel_init=zeros, bias_init=zeros, name="delta_out"
+        )(x)
+        return hidden, jnp.concatenate([q_vals, delta], axis=-1)
 
 
 class TwinRNNQNetwork(nn.Module):
@@ -899,6 +955,15 @@ def make_train(config, env):
     # Ablation: act with the teacher (twin Q maximised over the contexts) instead
     # of the behaviour Q, and train only the twin (no behaviour TD, no KL).
     act_with_teacher = bool(config.get("ACT_WITH_TEACHER", False))
+    # Decoupled acting head: the KL trains an offset delta (agent acts with
+    # Q_TD + delta) instead of the behaviour Q itself, so TD and its double-Q
+    # bootstrap stay exactly IQL's. DELTA_L2 * mean(delta^2) plays the role the
+    # TD loss plays in the coupled version: it pulls acting back towards Q_TD,
+    # so KL_WEIGHT / T^2 still sets how far behaviour moves towards the teacher.
+    decoupled = bool(config.get("DECOUPLED_ACT_HEAD", False))
+    delta_l2 = float(config.get("DELTA_L2", 1.0))
+    if decoupled and act_with_teacher:
+        raise ValueError("DECOUPLED_ACT_HEAD and ACT_WITH_TEACHER are exclusive.")
     slot_number = int(config.get("SLOT_NUMBER", 10))
     return_min = float(config.get("RETURN_MIN", 0.0))
     return_max = float(config.get("RETURN_MAX", 1.0))
@@ -975,7 +1040,23 @@ def make_train(config, env):
         n_actions = wrapped_env.max_action_space
 
         # INIT NETWORKS AND OPTIMIZER
-        network = RNNQNetwork(action_dim=n_actions, hidden_dim=config["HIDDEN_SIZE"])
+        if decoupled:
+            network = RNNQDeltaNetwork(
+                action_dim=n_actions,
+                hidden_dim=config["HIDDEN_SIZE"],
+                delta_hidden=int(config.get("DELTA_HIDDEN", config["HIDDEN_SIZE"])),
+            )
+        else:
+            network = RNNQNetwork(
+                action_dim=n_actions, hidden_dim=config["HIDDEN_SIZE"]
+            )
+
+        def split_heads(out):
+            """(Q_TD, delta) from the agent's output; delta is None if coupled."""
+            if decoupled:
+                return out[..., :n_actions], out[..., n_actions:]
+            return out, None
+
         labeler = None
         if use_corac:
             labeler = CoRACLabeler(
@@ -1079,11 +1160,16 @@ def make_train(config, env):
                 jnp.ones((n_agents, 1, 1, slot_number), dtype=bool),
             )
 
-        def acting_q(params, ctx_state, hs, _obs, _dones, avail):
-            """Q used to act for one step: the behaviour Q, or with ACT_WITH_TEACHER
-            the teacher (twin Q maximised over the bank). Returns (hs, (N, B, A))."""
+        def acting_q(params, ctx_state, hs, _obs, _dones, avail, head="act"):
+            """Q used to act for one step: the behaviour Q (Q_TD + delta with
+            DECOUPLED_ACT_HEAD; head="td" gives Q_TD alone), or with
+            ACT_WITH_TEACHER the teacher (twin Q maximised over the bank).
+            Returns (hs, (N, B, A))."""
             if not act_with_teacher:
-                new_hs, q = apply_agent(params["agent"], hs, _obs, _dones)
+                new_hs, out = apply_agent(params["agent"], hs, _obs, _dones)
+                q, delta = split_heads(out)
+                if delta is not None and head == "act":
+                    q = q + delta
                 return new_hs, q.squeeze(axis=1)
             bank, bank_valid = teacher_bank(ctx_state)
             new_hs, ctx_q = apply_twin(params["twin"], hs, _obs, _dones, bank)
@@ -1234,6 +1320,7 @@ def make_train(config, env):
                 # ---- targets
                 tp = train_state.target_network_params
                 _, q_next_target = apply_agent(tp["agent"], init_hs, _obs, _dones)
+                q_next_target = split_heads(q_next_target)[0]
                 _, twin_next_target = apply_twin(
                     tp["twin"], init_hs, _obs, _dones, contexts
                 )
@@ -1241,7 +1328,8 @@ def make_train(config, env):
                 kl_w = kl_weight_at(train_state.timesteps)
 
                 def _loss_fn(params):
-                    _, q_vals = apply_agent(params["agent"], init_hs, _obs, _dones)
+                    _, agent_out = apply_agent(params["agent"], init_hs, _obs, _dones)
+                    q_vals, delta = split_heads(agent_out)
                     _, twin_q = apply_twin(
                         params["twin"], init_hs, _obs, _dones, contexts
                     )
@@ -1274,7 +1362,14 @@ def make_train(config, env):
                     td_loss = jnp.mean((chosen - target) ** 2)
                     twin_td_loss = jnp.mean((twin_chosen - twin_target) ** 2)
 
-                    kl_p = q_vals[:, :-1] / kl_temperature
+                    if decoupled:
+                        # acting logits; the KL only reaches delta
+                        act_q = jax.lax.stop_gradient(q_vals[:, :-1]) + delta[:, :-1]
+                        delta_loss = jnp.mean(delta[:, :-1] ** 2)
+                    else:
+                        act_q = q_vals[:, :-1]
+                        delta_loss = jnp.zeros(())
+                    kl_p = act_q / kl_temperature
                     kl_q = teacher_q / kl_temperature
                     if kl_mask_unavailable:
                         ok = _avail[:, :-1] > 0
@@ -1285,7 +1380,12 @@ def make_train(config, env):
                     if act_with_teacher:
                         loss = twin_td_loss
                     else:
-                        loss = td_loss + twin_td_loss + kl_w * kl_loss
+                        loss = (
+                            td_loss
+                            + twin_td_loss
+                            + kl_w * kl_loss
+                            + delta_l2 * delta_loss
+                        )
                     aux = {
                         "td_loss": td_loss,
                         "twin_td_loss": twin_td_loss,
@@ -1294,9 +1394,19 @@ def make_train(config, env):
                         "twin_qvals": twin_chosen.mean(),
                         "twin_target_mean": twin_target.mean(),
                     }
+                    if decoupled:
+                        aux["delta_loss"] = delta_loss
+                        aux["delta_abs_mean"] = jnp.abs(delta[:, :-1]).mean()
+                        # how often acting differs from the TD-greedy action
+                        valid = _avail[:, :-1] > 0
+                        a_act = jnp.argmax(jnp.where(valid, act_q, -1e10), -1)
+                        a_td = jnp.argmax(
+                            jnp.where(valid, q_vals[:, :-1], -1e10), -1
+                        )
+                        aux["act_differs_td"] = (a_act != a_td).mean()
                     aux.update(
                         teacher_diagnostics(
-                            jax.lax.stop_gradient(q_vals[:, :-1]),
+                            jax.lax.stop_gradient(act_q),
                             teacher_q,
                             jax.lax.stop_gradient(twin_q[:, :-1]),
                             _avail[:, :-1],
@@ -1405,9 +1515,19 @@ def make_train(config, env):
             return runner_state, metrics
 
         def get_greedy_metrics(rng, train_state, ctx_state):
-            """Greedy evaluation of the acting Q (the behaviour Q unless ACT_WITH_TEACHER)."""
+            """Greedy evaluation of the acting Q (the behaviour Q unless
+            ACT_WITH_TEACHER). With DECOUPLED_ACT_HEAD the TD head alone is
+            evaluated too, under keys prefixed ``td_``."""
             if not config.get("TEST_DURING_TRAINING", True):
                 return None
+            metrics = greedy_metrics_head(rng, train_state, ctx_state, "act")
+            if decoupled:
+                rng, _rng = jax.random.split(rng)
+                td_metrics = greedy_metrics_head(_rng, train_state, ctx_state, "td")
+                metrics.update({"td_" + k: v for k, v in td_metrics.items()})
+            return metrics
+
+        def greedy_metrics_head(rng, train_state, ctx_state, head):
             params = train_state.params
 
             def _greedy_env_step(step_state, unused):
@@ -1417,7 +1537,13 @@ def make_train(config, env):
                 _dones = batchify(last_dones)[:, np.newaxis]
                 valid_actions = test_env.get_valid_actions(env_state.env_state)
                 hstate, q_vals = acting_q(
-                    params, ctx_state, hstate, _obs, _dones, batchify(valid_actions)
+                    params,
+                    ctx_state,
+                    hstate,
+                    _obs,
+                    _dones,
+                    batchify(valid_actions),
+                    head=head,
                 )
                 actions = get_greedy_actions(q_vals, batchify(valid_actions))
                 actions = unbatchify(actions)
