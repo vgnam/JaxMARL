@@ -35,6 +35,19 @@ is trained by TD alone, exactly as IQL (``DELTA_L2`` keeps delta small, the role
 the TD loss plays in the coupled version). Tests then also report the TD head
 alone (``test_td_*``).
 
+The teacher is a Q-function: the twin is trained on the episode's own,
+hindsight context (its return, and with HC-RAC its trajectory), so given c the
+value barely depends on the action and the max over contexts mostly picks noise.
+``TEACHER_TYPE: policy`` replaces it with a context-conditioned policy
+pi(a | tau, c) trained by behaviour cloning on the actions actually taken
+(return-conditioned supervised learning); the twin's greedy value only picks the
+bank context c* to condition on, and the KL target is log pi(. | tau, c*).
+``TEACHER_POLICY_CONTEXT: return`` (default) feeds the policy phi(R) only.
+Cloning on-policy data closes a loop (the teacher copies the behaviour, the KL
+pulls the behaviour to the teacher); ``TEACHER_TYPE: policy_ratio`` keeps only
+what c* changes, softmax(Q_TD / T + TEACHER_RATIO_SCALE * [log pi(a | tau, c*) -
+log pi_bank(a | tau)]), with pi_bank the mixture over the bank.
+
 Execution only uses the behaviour Q, exactly as IQL. The rollout, buffer and
 testing code follows ``iql_rnn.py``. Episodes are recovered inside every stored
 rollout from ``dones["__all__"]``; the return of the last, unfinished episode of
@@ -964,6 +977,38 @@ def make_train(config, env):
     delta_l2 = float(config.get("DELTA_L2", 1.0))
     if decoupled and act_with_teacher:
         raise ValueError("DECOUPLED_ACT_HEAD and ACT_WITH_TEACHER are exclusive.")
+    # Teacher type. "q": the twin Q over the bank (RAC). "policy": a context-
+    # conditioned policy pi(a | tau, c) trained by behaviour cloning on the
+    # actions actually taken, with c the episode's own (hindsight) context, as
+    # in return-conditioned supervised learning (upside-down RL, Decision
+    # Transformer). The twin Q then only chooses which bank context to condition
+    # on (its greedy value), and the KL target is log pi(. | tau, c*).
+    # "policy_ratio": only what the optimistic context changes. The KL target is
+    #   softmax(Q_TD / T + RATIO_SCALE * [log pi(a | tau, c*) - log pi_bank(a | tau)])
+    # with pi_bank the mixture of pi over the valid bank contexts. By Bayes the
+    # bracket is log P(c* | tau, a) - log P(c* | tau): how much action a raises
+    # the chance of an episode like c*. Whatever the behaviour does everywhere
+    # (e.g. LOAD under self-imitation) appears in both terms and cancels, so a
+    # teacher with nothing to add leaves acting at Q_TD (IQL).
+    teacher_type = str(config.get("TEACHER_TYPE", "q"))
+    if teacher_type not in ("q", "policy", "policy_ratio"):
+        raise ValueError(
+            "TEACHER_TYPE must be 'q', 'policy' or 'policy_ratio', "
+            f"got {teacher_type!r}."
+        )
+    uses_policy = teacher_type != "q"
+    ratio_scale = float(config.get("TEACHER_RATIO_SCALE", 1.0))
+    # Context the policy teacher reads: "return" = phi(R) only (HC-RAC) / the
+    # return bins (RAC); "full" = the whole context (with HC-RAC's trajectory
+    # embedding, which also encodes the episode's own actions).
+    policy_ctx_mode = str(config.get("TEACHER_POLICY_CONTEXT", "return"))
+    if policy_ctx_mode not in ("return", "full"):
+        raise ValueError(
+            f"TEACHER_POLICY_CONTEXT must be 'return' or 'full', got {policy_ctx_mode!r}."
+        )
+    bc_weight = float(config.get("TEACHER_BC_WEIGHT", 1.0))
+    if uses_policy and act_with_teacher:
+        raise ValueError("ACT_WITH_TEACHER only supports TEACHER_TYPE=q.")
     slot_number = int(config.get("SLOT_NUMBER", 10))
     return_min = float(config.get("RETURN_MIN", 0.0))
     return_max = float(config.get("RETURN_MAX", 1.0))
@@ -1077,8 +1122,31 @@ def make_train(config, env):
             hyper_hidden=twin_hyper_hidden,
         )
 
+        # Policy teacher: same recurrent + hypernetwork head as the twin, read as
+        # action logits; it sees the return part of the context unless "full".
+        if uses_policy:
+            if use_corac and policy_ctx_mode == "return":
+                if labeler.n_freq <= 0:
+                    raise ValueError(
+                        "TEACHER_POLICY_CONTEXT=return needs CORAC_USE_RETURN=True."
+                    )
+                policy_ctx_dim = labeler.n_freq  # phi(R) comes first in c
+            else:
+                policy_ctx_dim = context_dim
+            pteacher = TwinRNNQNetwork(
+                action_dim=n_actions,
+                hidden_dim=config["HIDDEN_SIZE"],
+                head="hyper",
+                hyper_hidden=twin_hyper_hidden,
+            )
+        else:
+            policy_ctx_dim, pteacher = context_dim, None
+
+        def policy_context(c):
+            return c[..., :policy_ctx_dim]
+
         def create_agent(rng):
-            rng_a, rng_t = jax.random.split(rng)
+            rng_a, rng_t, rng_p = jax.random.split(rng, 3)
             init_obs = jnp.zeros((1, 1, wrapped_env.obs_size))
             init_dones = jnp.zeros((1, 1))
             init_hs = ScannedRNN.initialize_carry(config["HIDDEN_SIZE"], 1)
@@ -1087,6 +1155,14 @@ def make_train(config, env):
                 "agent": network.init(rng_a, init_hs, init_obs, init_dones),
                 "twin": twin.init(rng_t, init_hs, init_obs, init_dones, init_ctx),
             }
+            if pteacher is not None:
+                params["pteacher"] = pteacher.init(
+                    rng_p,
+                    init_hs,
+                    init_obs,
+                    init_dones,
+                    jnp.zeros((1, 1, 1, policy_ctx_dim)),
+                )
             lr_scheduler = optax.linear_schedule(
                 init_value=config["LR"],
                 end_value=1e-10,
@@ -1145,6 +1221,12 @@ def make_train(config, env):
 
         apply_agent = jax.vmap(network.apply, in_axes=(None, 0, 0, 0))
         apply_twin = jax.vmap(twin.apply, in_axes=(None, 0, 0, 0, 0))
+        if pteacher is not None:
+            apply_pteacher = jax.vmap(pteacher.apply, in_axes=(None, 0, 0, 0, 0))
+
+        def masked_log_policy(logits, avail):
+            """log softmax over the available actions; avail broadcastable."""
+            return jax.nn.log_softmax(jnp.where(avail > 0, logits, -1e10), axis=-1)
 
         def teacher_bank(ctx_state):
             """Teacher contexts (N, 1, 1, M, C) and their mask (N, 1, 1, M)."""
@@ -1310,11 +1392,62 @@ def make_train(config, env):
                 _, all_ctx_q = apply_twin(
                     train_state.params["twin"], init_hs, _obs, _dones, bank
                 )  # (N, T, B, M, A)
-                teacher_q = select_teacher_q(
-                    all_ctx_q, _avail, bank_valid, teacher_mode, teacher_topk
-                )[:, :-1]
-                if twin_clamp:
-                    teacher_q = jnp.clip(teacher_q, ret_low, ret_high)
+                if teacher_type == "q":
+                    teacher_q = select_teacher_q(
+                        all_ctx_q, _avail, bank_valid, teacher_mode, teacher_topk
+                    )[:, :-1]
+                    if twin_clamp:
+                        teacher_q = jnp.clip(teacher_q, ret_low, ret_high)
+                else:
+                    # Policy teacher: log pi(. | tau, c*) with c* the bank
+                    # context of highest twin value (topk_mean: the mixture of
+                    # the k best). Stored as T * log pi so the KL below, which
+                    # divides by T, compares against log pi itself.
+                    _, pol_logits = apply_pteacher(
+                        train_state.params["pteacher"],
+                        init_hs,
+                        _obs,
+                        _dones,
+                        policy_context(bank),
+                    )  # (N, T, B, M, A)
+                    ctx_logp = masked_log_policy(pol_logits, _avail[..., None, :])
+                    ctx_value = jnp.where(
+                        _avail[..., None, :] > 0, all_ctx_q, -1e10
+                    ).max(-1)
+                    ctx_value = jnp.where(bank_valid, ctx_value, -1e10)  # (N,T,B,M)
+                    if teacher_mode == "topk_mean":
+                        k = min(teacher_topk, ctx_value.shape[-1])
+                        top_v, top_i = jax.lax.top_k(ctx_value, k)
+                        ok = top_v > -1e9
+                        sel = jnp.take_along_axis(ctx_logp, top_i[..., None], axis=-2)
+                        w = ok / jnp.maximum(ok.sum(-1, keepdims=True), 1)
+                        teacher_logp = jax.nn.logsumexp(
+                            sel + jnp.log(jnp.maximum(w, 1e-30))[..., None], axis=-2
+                        )
+                    else:
+                        best = jnp.argmax(ctx_value, axis=-1)
+                        teacher_logp = jnp.take_along_axis(
+                            ctx_logp, best[..., None, None], axis=-2
+                        )[..., 0, :]
+                    # floor: an unavailable action must not make the KL explode
+                    teacher_logp = jnp.maximum(teacher_logp, -20.0)
+                    if teacher_type == "policy":
+                        teacher_q = kl_temperature * teacher_logp[:, :-1]
+                    else:
+                        # log of the mixture of pi over every valid bank context
+                        n_valid_ctx = jnp.maximum(bank_valid.sum(-1), 1)  # (N,1,1)
+                        mix_logp = jax.nn.logsumexp(
+                            jnp.where(bank_valid[..., None], ctx_logp, -1e10), axis=-2
+                        ) - jnp.log(n_valid_ctx)[..., None]
+                        mix_logp = jnp.maximum(mix_logp, -20.0)
+                        ratio = (teacher_logp - mix_logp)[:, :-1]  # (N, T-1, B, A)
+                        stats["teacher_ratio_abs_mean"] = jnp.abs(ratio).mean()
+                        stats["teacher_ratio_max_mean"] = ratio.max(-1).mean()
+                        # added to sg(Q_TD) inside the loss (in Q units)
+                        teacher_bonus = kl_temperature * ratio_scale * ratio
+                        teacher_q = jnp.zeros_like(ratio)  # placeholder
+                if teacher_type != "policy_ratio":
+                    teacher_bonus = None
                 teacher_q = jax.lax.stop_gradient(teacher_q)
 
                 # ---- targets
@@ -1369,14 +1502,40 @@ def make_train(config, env):
                     else:
                         act_q = q_vals[:, :-1]
                         delta_loss = jnp.zeros(())
+                    if teacher_bonus is not None:
+                        # policy_ratio: the TD values plus what c* changes
+                        tq = jax.lax.stop_gradient(q_vals[:, :-1]) + teacher_bonus
+                    else:
+                        tq = teacher_q
                     kl_p = act_q / kl_temperature
-                    kl_q = teacher_q / kl_temperature
+                    kl_q = tq / kl_temperature
                     if kl_mask_unavailable:
                         ok = _avail[:, :-1] > 0
                         kl_p = jnp.where(ok, kl_p, -1e10)
                         kl_q = jnp.where(ok, kl_q, -1e10)
                     kl = categorical_kl(kl_p, kl_q)
                     kl_loss = kl.mean()
+                    if uses_policy:
+                        # behaviour cloning of the actions taken, conditioned on
+                        # the episode's own context
+                        _, own_logits = apply_pteacher(
+                            params["pteacher"],
+                            init_hs,
+                            _obs,
+                            _dones,
+                            policy_context(contexts),
+                        )
+                        own_logp = masked_log_policy(own_logits[..., 0, :], _avail)
+                        bc_nll = -jnp.take_along_axis(
+                            own_logp, _actions[..., None], axis=-1
+                        ).squeeze(-1)[:, :-1]
+                        bc_loss = bc_nll.mean()
+                        bc_acc = (
+                            jnp.argmax(own_logp, -1) == _actions
+                        )[:, :-1].mean()
+                    else:
+                        bc_loss = jnp.zeros(())
+                        bc_acc = jnp.zeros(())
                     if act_with_teacher:
                         loss = twin_td_loss
                     else:
@@ -1385,6 +1544,7 @@ def make_train(config, env):
                             + twin_td_loss
                             + kl_w * kl_loss
                             + delta_l2 * delta_loss
+                            + bc_weight * bc_loss
                         )
                     aux = {
                         "td_loss": td_loss,
@@ -1394,6 +1554,10 @@ def make_train(config, env):
                         "twin_qvals": twin_chosen.mean(),
                         "twin_target_mean": twin_target.mean(),
                     }
+                    aux["teacher_q_mean"] = tq.mean()
+                    if uses_policy:
+                        aux["teacher_bc_loss"] = bc_loss
+                        aux["teacher_bc_acc"] = bc_acc
                     if decoupled:
                         aux["delta_loss"] = delta_loss
                         aux["delta_abs_mean"] = jnp.abs(delta[:, :-1]).mean()
@@ -1407,7 +1571,7 @@ def make_train(config, env):
                     aux.update(
                         teacher_diagnostics(
                             jax.lax.stop_gradient(act_q),
-                            teacher_q,
+                            jax.lax.stop_gradient(tq),
                             jax.lax.stop_gradient(twin_q[:, :-1]),
                             _avail[:, :-1],
                             kl_temperature,
@@ -1423,7 +1587,6 @@ def make_train(config, env):
                 aux.update(stats)
                 aux["loss"] = loss
                 aux["kl_weight"] = kl_w
-                aux["teacher_q_mean"] = teacher_q.mean()
                 aux["return_rtg_low"] = ret_low
                 aux["return_rtg_high"] = ret_high
                 return (train_state, ctx_state, rng), aux
