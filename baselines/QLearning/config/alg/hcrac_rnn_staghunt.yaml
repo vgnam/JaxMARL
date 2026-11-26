@@ -1,0 +1,83 @@
+# HC-RAC (CONTRAIL) on predator-prey with miscapture punishment, main setting
+# (constant KL_WEIGHT, action_max teacher, fixed return range, EMA encoder).
+# Hyper-parameters above the method block are ql_rnn_staghunt's (IQL).
+#   python baselines/QLearning/rac_rnn.py +alg=hcrac_rnn_staghunt
+"ALG_NAME": "hcrac_rnn"
+"TOTAL_TIMESTEPS": 1e6 # PyMARL pred_prey t_max
+"NUM_ENVS": 8
+"NUM_STEPS": 201 # one 200-step episode per env per update (RNN learners reset every update)
+"BUFFER_SIZE": 1000 # episodes; PyMARL keeps 5000, which needs ~3 GB of GPU memory here
+"BUFFER_BATCH_SIZE": 32
+"HIDDEN_SIZE": 64
+"EPS_START": 1.0
+"EPS_FINISH": 0.05
+"EPS_DECAY": 0.1 # percentage of updates (overridden by EPS_DECAY_STEPS)
+"EPS_DECAY_STEPS": 50000 # env steps, as PyMARL (epsilon_anneal_time)
+"MAX_GRAD_NORM": 10
+"TARGET_UPDATE_INTERVAL": 25 # updates (x 8 episodes = 200 episodes)
+"TAU": 1.
+"NUM_EPOCHS": 8 # one batch per collected episode
+"LR": 0.0005
+"LEARNING_STARTS": 10000 # timesteps
+"LR_LINEAR_DECAY": True
+"GAMMA": 0.99
+"OPTIMIZER": "radam"
+
+# HC-RAC
+"CONTEXT_LABELER": "corac"
+"TWIN_HEAD": "hyper"
+"TWIN_HYPER_HIDDEN": 64
+"TWIN_TARGET_CLAMP": True
+"KL_LOGIT_TEMPERATURE_FRAC": 0.0
+"KL_WEIGHT": 0.5
+"KL_WEIGHT_FINAL": null
+"KL_ANNEAL_START": 0
+"KL_ANNEAL_END": 0
+"TEACHER_CONTEXT_SELECT": "action_max"
+"TEACHER_TOPK": 4
+"CORAC_USE_RETURN": True
+"CORAC_USE_TRAJECTORY": True
+"CORAC_N_FREQ": 16
+"CORAC_EMBED_DIM": 32
+"CORAC_RETURN_RANGE": [-200.0, 50.0] # as rac_rnn_staghunt
+"CORAC_TARGET_TAU": 0.005
+"CORAC_BANK_PUSH": 2
+"CORAC_BANK_SIZE": 64
+"CORAC_SEGMENT_LEN": 5
+"CORAC_HIDDEN_DIM": 64
+"CORAC_PROJ_DIM": 32
+"CORAC_TEMPERATURE": 0.1
+"CORAC_N_HARD": 4
+"CORAC_POOL_SIZE": 4096
+"CORAC_STAT_MOMENTUM": 0.01
+"CORAC_MIN_STD_FRAC": 0.0
+"CORAC_LR": 0.0005
+
+# ENV: PyMARL's pred_prey_punish (10x10, 8 agents, 8 stags, 5x5 views, 'catch'
+# by two adjacent agents, -2 per miscapture, +10 per stag, catchers freeze).
+# pred_prey_original: capture_action False, capture_freezes False,
+# miscapture_punishment 0, reward_stag 50, reward_time -0.1.
+"ENV_NAME": "StagHunt"
+"ENV_KWARGS":
+  "n_agents": 8
+  "n_stags": 8
+  "n_hare": 0
+  "world_shape": [10, 10]
+  "agent_obs": [2, 2]
+  "episode_limit": 200
+  "capture_action": True
+  "capture_action_conditions": [2, 1]
+  "miscapture_punishment": -2.0
+  "capture_freezes": True
+  "remove_frozen": True
+  "capture_terminal": False
+  "reward_stag": 10.0
+  "reward_time": 0.0
+
+# evaluate
+"TEST_DURING_TRAINING": True
+"TEST_INTERVAL": 0.05
+"TEST_NUM_STEPS": 201
+"TEST_NUM_ENVS": 64 # PyMARL tests 32 episodes
+
+"LOG_AGENTS_SEPARATELY": False # shared reward

@@ -388,6 +388,16 @@ class CTRolloutManager(JaxMARLWrapper):
                 [obs[agent].flatten() for agent in self.agents], axis=-1
             )
             self.global_reward = lambda rewards: rewards[self.training_agents[0]]
+        elif env.name == "StagHunt":
+            # PyMARL masks actions here: frozen agents can only stay, no moves
+            # into walls, 'catch' only next to a prey.
+            self.global_reward = lambda rewards: rewards[self.training_agents[0]]
+            self.get_valid_actions = lambda state: jax.vmap(env.get_avail_actions)(
+                state
+            )
+        elif env.name == "MatrixGame":
+            # every agent receives the (shared) payoff
+            self.global_reward = lambda rewards: rewards[self.training_agents[0]]
         elif "hanabi" in env.name.lower():
             self.global_reward = lambda rewards: rewards[self.training_agents[0]]
             self.get_valid_actions = lambda state: jax.vmap(

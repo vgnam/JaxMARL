@@ -29,6 +29,8 @@ envs_to_test = [
     "MPE_simple_facmac_9a_v1",
     "switch_riddle",
     "LBF",
+    "MatrixGame",
+    "StagHunt",
     "SMAX",
     "HeuristicEnemySMAX",
     # "ant_4x2",  # NOTE removed while brax is deprecated, will add back when we have a new physics engine

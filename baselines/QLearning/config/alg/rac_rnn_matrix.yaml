@@ -1,0 +1,58 @@
+# RAC on the cooperative matrix games.
+# Hyper-parameters above the method block are ql_rnn_matrix's (IQL).
+#   python baselines/QLearning/rac_rnn.py +alg=rac_rnn_matrix
+# Penalty game: alg.ENV_KWARGS.game=penalty alg.RETURN_MIN=-15 alg.RETURN_MAX=10
+"ALG_NAME": "rac_rnn"
+"TOTAL_TIMESTEPS": 1e5 # 8 one-step episodes per update: 5e4 episodes, as PyMARL's t_max 5e4
+"NUM_ENVS": 8
+"NUM_STEPS": 2 # one 1-step episode per env per update (+ the reset step): episode_limit + 1
+"BUFFER_SIZE": 5000
+"BUFFER_BATCH_SIZE": 32
+"HIDDEN_SIZE": 64
+"EPS_START": 1.0
+"EPS_FINISH": 0.05
+"EPS_DECAY": 0.1 # percentage of updates (overridden by EPS_DECAY_STEPS)
+"EPS_DECAY_STEPS": 1e5 # PyMARL anneals epsilon over the whole run (5e4 steps = episodes)
+"MAX_GRAD_NORM": 10
+"TARGET_UPDATE_INTERVAL": 25 # updates (x 8 episodes = 200 episodes)
+"TAU": 1.
+"NUM_EPOCHS": 8 # one batch per collected episode
+"LR": 0.0005
+"LEARNING_STARTS": 1000 # timesteps
+"LR_LINEAR_DECAY": True
+"GAMMA": 0.99
+"OPTIMIZER": "radam"
+
+# RAC
+"CONTEXT_LABELER": "return_bins"
+"SLOT_NUMBER": 6
+# Climbing payoffs are in [-30, 11] (penalty: [k, 10]); x episode_limit if repeated. SLOT_NUMBER 6 as PyMARL's matrix_game_rep_* configs.
+"RETURN_MIN": -30.0
+"RETURN_MAX": 11.0
+"TWIN_HEAD": "hyper"
+"TWIN_HYPER_HIDDEN": 0
+"KL_WEIGHT": 0.5 # main protocol (constant)
+"KL_WEIGHT_FINAL": null
+"KL_ANNEAL_START": 0
+"KL_ANNEAL_END": 0
+"TEACHER_CONTEXT_SELECT": "action_max"
+"TEACHER_TOPK": 4
+"TWIN_TARGET_CLAMP": False
+"KL_LOGIT_TEMPERATURE_FRAC": 0.0
+
+# ENV: game in {climbing, penalty, partially_stochastic_climbing,
+# fully_stochastic_climbing}. episode_limit > 1 repeats the game; then set
+# NUM_STEPS and TEST_NUM_STEPS to episode_limit + 1 and scale the return range.
+"ENV_NAME": "MatrixGame"
+"ENV_KWARGS":
+  "game": "climbing"
+  "episode_limit": 1
+  "penalty_k": -15.0
+
+# evaluate
+"TEST_DURING_TRAINING": True
+"TEST_INTERVAL": 0.02
+"TEST_NUM_STEPS": 2
+"TEST_NUM_ENVS": 128
+
+"LOG_AGENTS_SEPARATELY": False

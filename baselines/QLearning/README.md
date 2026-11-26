@@ -42,6 +42,8 @@ keys, so each method differs from IQL by its algorithm alone:
 | JaxRobotarium | `iql_rnn.py +alg=ql_rnn_jaxrobotarium` | `rac_rnn.py` / `i2q_rnn.py`, `*_rnn_jaxrobotarium` |
 | Overcooked | `iql_cnn_overcooked.py +alg=ql_cnn_overcooked` | `rac_cnn_overcooked.py` / `i2q_cnn_overcooked.py`, `*_cnn_overcooked` |
 | LBF | `iql_rnn.py +alg=ql_rnn_lbf` (no upstream preset, see below) | `rac_rnn.py` / `i2q_rnn.py`, `*_rnn_lbf` |
+| Matrix games | `iql_rnn.py +alg=ql_rnn_matrix` (no upstream preset, see below) | `rac_rnn.py` / `i2q_rnn.py`, `*_rnn_matrix` |
+| Predator-prey (StagHunt) | `iql_rnn.py +alg=ql_rnn_staghunt` (no upstream preset, see below) | `rac_rnn.py` / `i2q_rnn.py`, `*_rnn_staghunt` |
 
 The RNN learners share `iql_rnn.py`'s rollout, replay buffer, recurrent
 Q-network and greedy evaluation; the Overcooked ones share
@@ -128,6 +130,35 @@ episode return and the RAC / HC-RAC return range are [0, 1] on every task.
 python baselines/QLearning/iql_rnn.py +alg=ql_rnn_lbf
 python baselines/QLearning/rac_rnn.py +alg=hcrac_rnn_lbf alg.ENV_KWARGS.sight=2
 python baselines/QLearning/i2q_rnn.py +alg=i2q_rnn_lbf alg.ENV_KWARGS.field_size=10 alg.ENV_KWARGS.num_agents=3 alg.ENV_KWARGS.max_num_food=3
+```
+
+Matrix games (`ENV_NAME: MatrixGame`, `jaxmarl/environments/matrix_game`) port
+PyMARL's cooperative two-player games: `climbing` (optimum (0, 0) = 11 next to
+-30 penalties, the textbook case of relative overgeneralisation), `penalty`
+(`penalty_k`, default -15), `partially_stochastic_climbing` and
+`fully_stochastic_climbing`. Both agents receive the payoff; `episode_limit`
+repeats the game. The `*_rnn_matrix` presets follow PyMARL (5e4 one-step
+episodes, epsilon annealed over the whole run); RAC and HC-RAC use the payoff
+range as return range, and HC-RAC uses the return features only (one-step
+episodes have no TCL windows).
+
+Predator-prey (`ENV_NAME: StagHunt`, `jaxmarl/environments/stag_hunt`) ports
+the DCG / PyMARL `stag_hunt` grid world. The defaults and the `*_rnn_staghunt`
+presets are PyMARL's `pred_prey_punish`: 10x10, 8 agents, 8 stags, 5x5 views,
+a stag is caught when two adjacent agents play `catch` (+10, the catchers
+freeze), and a lone catcher costs -2, so independent learners learn to avoid
+catching. Actions are masked as in PyMARL (frozen agents only stay, no moves
+into walls, `catch` only next to a prey); `CTRolloutManager` reads the env's
+masks for this env. `pred_prey_original` is `capture_action=False`,
+`capture_freezes=False`, `miscapture_punishment=0`, `reward_stag=50`,
+`reward_time=-0.1`. The presets keep 1000 episodes in the replay buffer
+(PyMARL: 5000, about 3 GB of GPU memory here).
+
+```bash
+python baselines/QLearning/iql_rnn.py +alg=ql_rnn_matrix alg.ENV_KWARGS.game=penalty
+python baselines/QLearning/rac_rnn.py +alg=hcrac_rnn_matrix
+python baselines/QLearning/rac_rnn.py +alg=rac_rnn_staghunt
+python baselines/QLearning/i2q_rnn.py +alg=i2q_rnn_staghunt
 ```
 
 #### Checkpoint and resume

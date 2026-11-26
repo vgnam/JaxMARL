@@ -28,6 +28,8 @@ from .environments import (
     SimpleWorldCommMPE,
     SwitchRiddle,
     LBF,
+    MatrixGame,
+    StagHunt,
 )
 
 # MABrax requires brax, an optional dependency
@@ -88,6 +90,12 @@ def make(env_id: str, **env_kwargs) -> MultiAgentEnv:
     # 2b. Level-Based Foraging (port of lbforaging v3)
     elif env_id == "LBF":
         env = LBF(**env_kwargs)
+
+    # 2c. Cooperative matrix games and predator-prey (ports of PyMARL's envs)
+    elif env_id == "MatrixGame":
+        env = MatrixGame(**env_kwargs)
+    elif env_id == "StagHunt":
+        env = StagHunt(**env_kwargs)
 
     # 3. SMAX
     elif env_id == "SMAX":
@@ -190,6 +198,8 @@ registered_envs = [
     "MPE_simple_facmac_9a_v1",
     "switch_riddle",
     "LBF",
+    "MatrixGame",
+    "StagHunt",
     "SMAX",
     "HeuristicEnemySMAX",
     "LearnedPolicyEnemySMAX",

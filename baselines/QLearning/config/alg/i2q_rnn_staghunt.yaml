@@ -1,0 +1,57 @@
+# I2Q on predator-prey with miscapture punishment.
+# Hyper-parameters above the method block are ql_rnn_staghunt's (IQL).
+#   python baselines/QLearning/i2q_rnn.py +alg=i2q_rnn_staghunt
+"ALG_NAME": "i2q_rnn"
+"TOTAL_TIMESTEPS": 1e6 # PyMARL pred_prey t_max
+"NUM_ENVS": 8
+"NUM_STEPS": 201 # one 200-step episode per env per update (RNN learners reset every update)
+"BUFFER_SIZE": 1000 # episodes; PyMARL keeps 5000, which needs ~3 GB of GPU memory here
+"BUFFER_BATCH_SIZE": 32
+"HIDDEN_SIZE": 64
+"EPS_START": 1.0
+"EPS_FINISH": 0.05
+"EPS_DECAY": 0.1 # percentage of updates (overridden by EPS_DECAY_STEPS)
+"EPS_DECAY_STEPS": 50000 # env steps, as PyMARL (epsilon_anneal_time)
+"MAX_GRAD_NORM": 10
+"TARGET_UPDATE_INTERVAL": 25 # updates (x 8 episodes = 200 episodes)
+"TAU": 1.
+"NUM_EPOCHS": 8 # one batch per collected episode
+"LR": 0.0005
+"LEARNING_STARTS": 10000 # timesteps
+"LR_LINEAR_DECAY": True
+"GAMMA": 0.99
+"OPTIMIZER": "radam"
+
+# I2Q (Jiang & Lu, NeurIPS 2022), defaults from the authors' SMAC config.
+"I2Q_LAMBDA": 0.2
+"I2Q_TAU": 0.52
+"I2Q_HIDDEN_DIM": 256
+
+# ENV: PyMARL's pred_prey_punish (10x10, 8 agents, 8 stags, 5x5 views, 'catch'
+# by two adjacent agents, -2 per miscapture, +10 per stag, catchers freeze).
+# pred_prey_original: capture_action False, capture_freezes False,
+# miscapture_punishment 0, reward_stag 50, reward_time -0.1.
+"ENV_NAME": "StagHunt"
+"ENV_KWARGS":
+  "n_agents": 8
+  "n_stags": 8
+  "n_hare": 0
+  "world_shape": [10, 10]
+  "agent_obs": [2, 2]
+  "episode_limit": 200
+  "capture_action": True
+  "capture_action_conditions": [2, 1]
+  "miscapture_punishment": -2.0
+  "capture_freezes": True
+  "remove_frozen": True
+  "capture_terminal": False
+  "reward_stag": 10.0
+  "reward_time": 0.0
+
+# evaluate
+"TEST_DURING_TRAINING": True
+"TEST_INTERVAL": 0.05
+"TEST_NUM_STEPS": 201
+"TEST_NUM_ENVS": 64 # PyMARL tests 32 episodes
+
+"LOG_AGENTS_SEPARATELY": False # shared reward
