@@ -110,6 +110,27 @@ def make_train(config, env):
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
 
+    # PyMARL-parity switches. CORRECT_DONE_INDEX and OBS_LAST_ACTION default to
+    # True (set them to False for upstream JaxMARL's behaviour).
+    # CORRECT_DONE_INDEX: the buffer stores dones[t] = "obs t starts a new
+    #   episode" (last_dones, upstream commit 7b17099), so transition t is
+    #   terminal iff dones[t + 1]; upstream's target still reads dones[t].
+    # OBS_LAST_ACTION: append the one-hot of the agent's previous action to its
+    #   input (zeros at the first step of an episode), as PyMARL / EPyMARL's
+    #   obs_last_action. Without it IQL stays near 0 on LBF coop tasks.
+    # TIMELIMIT_MODE: "terminal" treats the time limit as a terminal state
+    #   (upstream); "mask" drops the transitions cut by the time limit from the
+    #   loss (PyMARL bootstraps them instead, but the auto-reset hides the final
+    #   obs). Needs TIME_LIMIT (episode length) and rollouts starting at a reset.
+    correct_done = bool(config.get("CORRECT_DONE_INDEX", True))
+    obs_last_action = bool(config.get("OBS_LAST_ACTION", True))
+    timelimit_mode = str(config.get("TIMELIMIT_MODE", "terminal"))
+    if timelimit_mode not in ("terminal", "mask"):
+        raise ValueError(f"TIMELIMIT_MODE must be terminal or mask, got {timelimit_mode!r}.")
+    time_limit = int(config.get("TIME_LIMIT", 0) or 0)
+    if timelimit_mode == "mask" and time_limit <= 0:
+        raise ValueError("TIMELIMIT_MODE=mask needs TIME_LIMIT (episode length).")
+
     eps_scheduler = optax.linear_schedule(
         init_value=config["EPS_START"],
         end_value=config["EPS_FINISH"],
@@ -155,6 +176,15 @@ def make_train(config, env):
     def unbatchify(x: jnp.ndarray):
         return {agent: x[i] for i, agent in enumerate(env.agents)}
 
+    def with_last_action(obs, last_onehot, resets):
+        """obs (..., O) + previous-action one-hot (..., A), zeroed where the obs
+        starts an episode; identity without OBS_LAST_ACTION."""
+        if not obs_last_action:
+            return obs
+        return jnp.concatenate(
+            [obs, last_onehot * (1.0 - resets[..., None].astype(obs.dtype))], axis=-1
+        )
+
     def train(rng, runner_state=None, num_updates=None):
 
         # INIT ENV
@@ -171,10 +201,13 @@ def make_train(config, env):
             hidden_dim=config["HIDDEN_SIZE"],
         )
 
+        n_actions = wrapped_env.max_action_space
+        input_size = wrapped_env.obs_size + (n_actions if obs_last_action else 0)
+
         def create_agent(rng):
             init_x = (
                 jnp.zeros(
-                    (1, 1, wrapped_env.obs_size)
+                    (1, 1, input_size)
                 ),  # (time_step, batch_size, obs_size)
                 jnp.zeros((1, 1)),  # (time_step, batch size)
             )
@@ -191,9 +224,21 @@ def make_train(config, env):
 
             lr = lr_scheduler if config.get("LR_LINEAR_DECAY", False) else config["LR"]
 
+            opt_name = str(config.get("OPTIMIZER", "radam")).lower()
+            if opt_name == "radam":
+                opt = optax.radam(learning_rate=lr)
+            elif opt_name == "adam":
+                opt = optax.adam(learning_rate=lr)
+            elif opt_name == "rmsprop":
+                # PyMARL: RMSprop(alpha=0.99, eps=1e-5)
+                opt = optax.rmsprop(learning_rate=lr, decay=0.99, eps=1e-5)
+            else:
+                raise ValueError(
+                    f"OPTIMIZER must be radam, adam or rmsprop, got {opt_name!r}."
+                )
             tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                optax.radam(learning_rate=lr),
+                opt,
             )
 
             train_state = CustomTrainState.create(
@@ -257,11 +302,13 @@ def make_train(config, env):
 
             # SAMPLE PHASE
             def _step_env(carry, _):
-                hs, last_obs, last_dones, env_state, rng = carry
+                hs, last_obs, last_dones, last_act, env_state, rng = carry
                 rng, rng_a, rng_s = jax.random.split(rng, 3)
 
                 # (num_agents, 1 (dummy time), num_envs, obs_size)
-                _obs = batchify(last_obs)[:, np.newaxis]
+                _obs = with_last_action(
+                    batchify(last_obs), last_act, batchify(last_dones)
+                )[:, np.newaxis]
                 _dones = batchify(last_dones)[:, np.newaxis]
 
                 new_hs, q_vals = jax.vmap(
@@ -284,6 +331,7 @@ def make_train(config, env):
                 actions = jax.vmap(eps_greedy_exploration, in_axes=(0, 0, None, 0))(
                     _rngs, q_vals, eps, batchify(avail_actions)
                 )
+                new_last_act = jax.nn.one_hot(actions, n_actions)
                 actions = unbatchify(actions)
 
                 new_obs, new_env_state, rewards, dones, infos = wrapped_env.batch_step(
@@ -301,7 +349,10 @@ def make_train(config, env):
                     dones=last_dones,
                     avail_actions=avail_actions,
                 )
-                return (new_hs, new_obs, dones, new_env_state, rng), (timestep, infos)
+                return (new_hs, new_obs, dones, new_last_act, new_env_state, rng), (
+                    timestep,
+                    infos,
+                )
 
             # step the env (should be a complete rollout)
             rng, _rng = jax.random.split(rng)
@@ -313,7 +364,10 @@ def make_train(config, env):
             init_hs = ScannedRNN.initialize_carry(
                 config["HIDDEN_SIZE"], len(env.agents), config["NUM_ENVS"]
             )
-            expl_state = (init_hs, init_obs, init_dones, env_state)
+            init_last_act = jnp.zeros(
+                (len(env.agents), config["NUM_ENVS"], n_actions)
+            )
+            expl_state = (init_hs, init_obs, init_dones, init_last_act, env_state)
             rng, _rng = jax.random.split(rng)
             _, (timesteps, infos) = jax.lax.scan(
                 _step_env,
@@ -361,6 +415,13 @@ def make_train(config, env):
                 _actions = batchify(minibatch.actions)
                 _rewards = batchify(minibatch.rewards)
                 _avail_actions = batchify(minibatch.avail_actions)
+                if obs_last_action:
+                    # previous action of step t = action of step t - 1 (zeros at t = 0)
+                    prev = jax.nn.one_hot(_actions, n_actions)
+                    prev = jnp.concatenate(
+                        [jnp.zeros_like(prev[:, :1]), prev[:, :-1]], axis=1
+                    )
+                    _obs = with_last_action(_obs, prev, _dones)
 
                 _, q_next_target = jax.vmap(network.apply, in_axes=(None, 0, 0, 0))(
                     train_state.target_network_params,
@@ -394,15 +455,35 @@ def make_train(config, env):
                         axis=-1,
                     ).squeeze(-1)  # (num_agents, timesteps, batch_size,)
 
+                    # terminal flag of transition t
+                    term = _dones[:, 1:] if correct_done else _dones[:, :-1]
                     target = (
                         _rewards[:, :-1]
-                        + (1 - _dones[:, :-1]) * config["GAMMA"] * q_next[:, 1:]
+                        + (1 - term) * config["GAMMA"] * q_next[:, 1:]
                     )
 
                     chosen_action_q_vals = chosen_action_q_vals[:, :-1]
-                    loss = jnp.mean(
-                        (chosen_action_q_vals - jax.lax.stop_gradient(target)) ** 2
-                    )
+                    sq = (chosen_action_q_vals - jax.lax.stop_gradient(target)) ** 2
+                    if timelimit_mode == "mask":
+                        # steps since the episode started (rollouts start at a reset)
+                        def count(c, d):
+                            c = jnp.where(d, 0, c + 1)
+                            return c, c
+
+                        d0 = _dones[0]  # (T, B), the same for every agent
+                        _, t_in_ep = jax.lax.scan(
+                            count, -jnp.ones(d0.shape[1:], jnp.int32), d0
+                        )  # (T, B): 0 at the first step of an episode
+                        cut = (
+                            _dones[0, 1:].astype(bool)
+                            & (t_in_ep[:-1] + 1 >= time_limit)
+                        )  # transition t ended by the time limit
+                        keep = (~cut)[None].astype(sq.dtype)
+                        loss = (sq * keep).sum() / jnp.maximum(
+                            keep.sum() * sq.shape[0], 1.0
+                        )
+                    else:
+                        loss = jnp.mean(sq)
 
                     return loss, chosen_action_q_vals.mean()
 
@@ -510,9 +591,13 @@ def make_train(config, env):
             params = train_state.params
 
             def _greedy_env_step(step_state, unused):
-                params, env_state, last_obs, last_dones, hstate, rng = step_state
+                params, env_state, last_obs, last_dones, last_act, hstate, rng = (
+                    step_state
+                )
                 rng, key_s = jax.random.split(rng)
-                _obs = batchify(last_obs)[:, np.newaxis]
+                _obs = with_last_action(
+                    batchify(last_obs), last_act, batchify(last_dones)
+                )[:, np.newaxis]
                 _dones = batchify(last_dones)[:, np.newaxis]
                 hstate, q_vals = jax.vmap(network.apply, in_axes=(None, 0, 0, 0))(
                     params,
@@ -523,12 +608,13 @@ def make_train(config, env):
                 q_vals = q_vals.squeeze(axis=1)
                 valid_actions = test_env.get_valid_actions(env_state.env_state)
                 actions = get_greedy_actions(q_vals, batchify(valid_actions))
+                last_act = jax.nn.one_hot(actions, n_actions)
                 actions = unbatchify(actions)
                 obs, env_state, rewards, dones, infos = test_env.batch_step(
                     key_s, env_state, actions
                 )
                 infos = schedules.drop_shaped_reward(infos)
-                step_state = (params, env_state, obs, dones, hstate, rng)
+                step_state = (params, env_state, obs, dones, last_act, hstate, rng)
                 return step_state, (rewards, dones, infos)
 
             rng, _rng = jax.random.split(rng)
@@ -546,6 +632,7 @@ def make_train(config, env):
                 env_state,
                 init_obs,
                 init_dones,
+                jnp.zeros((len(env.agents), config["TEST_NUM_ENVS"], n_actions)),
                 hstate,
                 _rng,
             )
@@ -643,7 +730,8 @@ def single_run(config):
             env_name.upper(),
             f"jax_{jax.__version__}",
         ],
-        name=f"{alg_name}_{env_name}",
+        name=f"{alg_name}_{env_name}_s{config['SEED']}",
+        job_type=alg_name,  # W&B: group by Group, then Job Type -> one curve per method
         config=config,
         mode=config["WANDB_MODE"],
     )

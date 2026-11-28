@@ -1075,6 +1075,20 @@ def make_train(config, env):
     def unbatchify(x: jnp.ndarray):
         return {agent: x[i] for i, agent in enumerate(env.agents)}
 
+    # OBS_LAST_ACTION: every network (behaviour Q, twin, policy teacher) also
+    # reads the one-hot of the agent's previous action (zeros at the first step
+    # of an episode), as PyMARL's obs_last_action. The context labeler keeps the
+    # raw observations. On by default (False: the earlier, PyMARL-incompatible
+    # inputs).
+    obs_last_action = bool(config.get("OBS_LAST_ACTION", True))
+
+    def with_last_action(obs, last_onehot, resets):
+        if not obs_last_action:
+            return obs
+        return jnp.concatenate(
+            [obs, last_onehot * (1.0 - resets[..., None].astype(obs.dtype))], axis=-1
+        )
+
     def train(rng, runner_state=None, num_updates=None):
 
         original_seed = rng[0]
@@ -1147,7 +1161,9 @@ def make_train(config, env):
 
         def create_agent(rng):
             rng_a, rng_t, rng_p = jax.random.split(rng, 3)
-            init_obs = jnp.zeros((1, 1, wrapped_env.obs_size))
+            init_obs = jnp.zeros(
+                (1, 1, wrapped_env.obs_size + (n_actions if obs_last_action else 0))
+            )
             init_dones = jnp.zeros((1, 1))
             init_hs = ScannedRNN.initialize_carry(config["HIDDEN_SIZE"], 1)
             init_ctx = jnp.zeros((1, 1, 1, context_dim))
@@ -1267,9 +1283,11 @@ def make_train(config, env):
 
             # SAMPLE PHASE (behaviour Q only, exactly as IQL)
             def _step_env(carry, _):
-                hs, last_obs, last_dones, env_state, rng = carry
+                hs, last_obs, last_dones, last_act, env_state, rng = carry
                 rng, rng_a, rng_s = jax.random.split(rng, 3)
-                _obs = batchify(last_obs)[:, np.newaxis]
+                _obs = with_last_action(
+                    batchify(last_obs), last_act, batchify(last_dones)
+                )[:, np.newaxis]
                 _dones = batchify(last_dones)[:, np.newaxis]
                 avail_actions = wrapped_env.get_valid_actions(env_state.env_state)
                 new_hs, q_vals = acting_q(
@@ -1281,6 +1299,7 @@ def make_train(config, env):
                 actions = jax.vmap(eps_greedy_exploration, in_axes=(0, 0, None, 0))(
                     _rngs, q_vals, eps, batchify(avail_actions)
                 )
+                new_last_act = jax.nn.one_hot(actions, n_actions)
                 actions = unbatchify(actions)
                 new_obs, new_env_state, rewards, dones, infos = wrapped_env.batch_step(
                     rng_s, env_state, actions
@@ -1297,7 +1316,10 @@ def make_train(config, env):
                     dones=last_dones,
                     avail_actions=avail_actions,
                 )
-                return (new_hs, new_obs, dones, new_env_state, rng), (timestep, infos)
+                return (new_hs, new_obs, dones, new_last_act, new_env_state, rng), (
+                    timestep,
+                    infos,
+                )
 
             rng, _rng = jax.random.split(rng)
             init_obs, env_state = wrapped_env.batch_reset(_rng)
@@ -1308,10 +1330,11 @@ def make_train(config, env):
             init_hs = ScannedRNN.initialize_carry(
                 config["HIDDEN_SIZE"], n_agents, config["NUM_ENVS"]
             )
+            init_last_act = jnp.zeros((n_agents, config["NUM_ENVS"], n_actions))
             rng, _rng = jax.random.split(rng)
             _, (timesteps, infos) = jax.lax.scan(
                 _step_env,
-                (init_hs, init_obs, init_dones, env_state, _rng),
+                (init_hs, init_obs, init_dones, init_last_act, env_state, _rng),
                 None,
                 config["NUM_STEPS"],
             )
@@ -1339,19 +1362,28 @@ def make_train(config, env):
                 init_hs = ScannedRNN.initialize_carry(
                     config["HIDDEN_SIZE"], n_agents, B
                 )
-                _obs = batchify(minibatch.obs)
+                _obs_raw = batchify(minibatch.obs)
                 _dones = batchify(minibatch.dones)
                 _actions = batchify(minibatch.actions)
                 _rewards = batchify(minibatch.rewards)
                 _avail = batchify(minibatch.avail_actions)
                 ep_dones = minibatch.dones["__all__"]  # (T, B)
                 T = ep_dones.shape[0]
+                if obs_last_action:
+                    # previous action of step t = action of step t - 1 (zeros at t = 0)
+                    prev = jax.nn.one_hot(_actions, n_actions)
+                    prev = jnp.concatenate(
+                        [jnp.zeros_like(prev[:, :1]), prev[:, :-1]], axis=1
+                    )
+                    _obs = with_last_action(_obs_raw, prev, _dones)
+                else:
+                    _obs = _obs_raw
 
                 # ---- contexts of every step and the teacher's support
                 stats = {}
                 if use_corac:
                     contexts, ctx_state, stats = labeler.label(
-                        rng_c, ctx_state, _obs, _actions, _rewards, ep_dones
+                        rng_c, ctx_state, _obs_raw, _actions, _rewards, ep_dones
                     )
                     bank = ctx_state["bank"][:, None, None]  # (N, 1, 1, M, C)
                     bank_valid = labeler.bank_valid(ctx_state)[
@@ -1694,9 +1726,13 @@ def make_train(config, env):
             params = train_state.params
 
             def _greedy_env_step(step_state, unused):
-                params, env_state, last_obs, last_dones, hstate, rng = step_state
+                params, env_state, last_obs, last_dones, last_act, hstate, rng = (
+                    step_state
+                )
                 rng, key_s = jax.random.split(rng)
-                _obs = batchify(last_obs)[:, np.newaxis]
+                _obs = with_last_action(
+                    batchify(last_obs), last_act, batchify(last_dones)
+                )[:, np.newaxis]
                 _dones = batchify(last_dones)[:, np.newaxis]
                 valid_actions = test_env.get_valid_actions(env_state.env_state)
                 hstate, q_vals = acting_q(
@@ -1709,12 +1745,13 @@ def make_train(config, env):
                     head=head,
                 )
                 actions = get_greedy_actions(q_vals, batchify(valid_actions))
+                last_act = jax.nn.one_hot(actions, n_actions)
                 actions = unbatchify(actions)
                 obs, env_state, rewards, dones, infos = test_env.batch_step(
                     key_s, env_state, actions
                 )
                 infos = schedules.drop_shaped_reward(infos)
-                step_state = (params, env_state, obs, dones, hstate, rng)
+                step_state = (params, env_state, obs, dones, last_act, hstate, rng)
                 return step_state, (rewards, dones, infos)
 
             rng, _rng = jax.random.split(rng)
@@ -1727,7 +1764,15 @@ def make_train(config, env):
             hstate = ScannedRNN.initialize_carry(
                 config["HIDDEN_SIZE"], n_agents, config["TEST_NUM_ENVS"]
             )
-            step_state = (params, env_state, init_obs, init_dones, hstate, _rng)
+            step_state = (
+                params,
+                env_state,
+                init_obs,
+                init_dones,
+                jnp.zeros((n_agents, config["TEST_NUM_ENVS"], n_actions)),
+                hstate,
+                _rng,
+            )
             step_state, (rewards, dones, infos) = jax.lax.scan(
                 _greedy_env_step, step_state, None, config["TEST_NUM_STEPS"]
             )
@@ -1806,7 +1851,8 @@ def single_run(config):
         entity=config["ENTITY"],
         project=config["PROJECT"],
         tags=[alg_name.upper(), env_name.upper(), f"jax_{jax.__version__}"],
-        name=f"{alg_name}_{env_name}",
+        name=f"{alg_name}_{env_name}_s{config['SEED']}",
+        job_type=alg_name,  # W&B: group by Group, then Job Type -> one curve per method
         config=config,
         mode=config["WANDB_MODE"],
     )

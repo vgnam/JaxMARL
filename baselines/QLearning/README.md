@@ -49,6 +49,25 @@ The RNN learners share `iql_rnn.py`'s rollout, replay buffer, recurrent
 Q-network and greedy evaluation; the Overcooked ones share
 `iql_cnn_overcooked.py`'s CNN, 1-step rollouts and flat transition buffer.
 
+Two changes to the RNN learners (`iql_rnn.py`, `rac_rnn.py`, `i2q_rnn.py`)
+make them match PyMARL / EPyMARL, and are on by default:
+
+- `OBS_LAST_ACTION: True`: every agent also reads the one-hot of its previous
+  action (zeros at the start of an episode), as PyMARL's `obs_last_action`.
+  Without it the agent cannot tell what it just did when the observation does
+  not change (a failed `LOAD`, waiting), and IQL, I2Q and RAC stay near 0 on
+  LBF coop tasks (IQL: 0.005 without, 0.30-0.49 with, at 2e6 steps).
+- `CORRECT_DONE_INDEX: True` (`iql_rnn.py` only): upstream stores
+  `dones[t]` = "obs t starts a new episode" (commit 7b17099) but its TD target
+  still reads `dones[t]` for transition t, so the last step of an episode
+  bootstraps into the next episode and the first step of a new one is treated
+  as terminal. `rac_rnn.py` / `i2q_rnn.py` always used `dones[t + 1]`.
+  (`vdn_rnn.py` / `qmix_rnn.py` keep upstream's indexing.)
+
+Set both to `False` to reproduce upstream JaxMARL. `iql_rnn.py` also has
+`TIMELIMIT_MODE: mask` (+ `TIME_LIMIT`), which drops time-limit transitions from
+the loss; it made no difference on LBF coop.
+
 - **RAC** (`rac_rnn.py`, `+alg=rac_rnn_*`): besides the behaviour Q, each agent
   trains a twin Q conditioned on a one-hot bin of the episode return
   (`SLOT_NUMBER` bins over [`RETURN_MIN`, `RETURN_MAX`], in `REW_SCALE` units).
@@ -117,10 +136,10 @@ for 50-step episodes and PyMARL/EPyMARL's IQL settings (2e6 steps, gamma 0.99,
 lr 5e-4, grad clip 10, epsilon over 50k steps, about one replay batch per
 collected episode, target update every 200 batches). IQL then reaches ~0.9
 greedy return on `Foraging-8x8-2p-2f-v3` (`force_coop: False`) in 2e6 steps. On
-the `-coop` task this IQL stays near 0, while PyMARL's IQL reaches ~0.89 on the
-same task (seed 0), so the gap is in the learner, not the environment; it is
-not resolved yet (PyMARL differs in last-action inputs, RMSprop, constant lr
-and one environment per batch). The
+the `-coop` task IQL without `OBS_LAST_ACTION` stays near 0, while PyMARL's IQL
+reaches ~0.89 (seed 0) and EPyMARL reports 1.00; with the last action it reaches
+0.30-0.49 at 2e6 steps (seed 0), still below PyMARL (RMSprop, constant lr and
+one environment per batch did not close the rest of the gap). The
 default task is `Foraging-8x8-2p-2f-coop-v3`; `ENV_KWARGS` mirror the task name
 (`field_size`, `num_agents`, `max_num_food`, `force_coop`, `sight: 2` for `-2s`).
 With `shared_rewards` every agent gets the normalised team reward, so the
